@@ -35,4 +35,9 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_scheduler_class": "DynamoKVBMConnectorLeader",
         "connector_worker_class": "DynamoKVBMConnectorWorker",
     },
+    "async_offload": {
+        "connector_module": "tensorrt_llm._torch.pyexecutor.connectors.async_offload.connector",
+        "connector_scheduler_class": "AsyncOffloadLeader",
+        "connector_worker_class": "AsyncOffloadWorker",
+    },
 }
