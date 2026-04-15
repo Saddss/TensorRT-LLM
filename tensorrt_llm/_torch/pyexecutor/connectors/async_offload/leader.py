@@ -21,7 +21,7 @@ class AsyncOffloadLeader(KvCacheConnectorScheduler):
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
-        self.tokens_per_block = llm_args.kv_cache_config.tokens_per_block
+        self.tokens_per_block = llm_args.kv_cache_config.tokens_per_block or 32
         self.block_pool: CpuBlockPool = None
 
         self.request_hashes: Dict[int, List[int]] = {}
