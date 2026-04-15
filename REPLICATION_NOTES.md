@@ -89,3 +89,19 @@ This catches *any* exception (not just dtype-related ones, e.g., OOM would also
 be caught and silently retried). The uint8 view also assumes byte-level compatibility
 between fp8 and uint8 representations, which works for raw memory copies but could
 be fragile if tensor operations (rather than raw copies) are performed on the CPU cache.
+
+---
+
+## Resolution Status (v1.1)
+
+| Issue | Status | Action |
+|-------|--------|--------|
+| 1. Import path | Already adapted | No change needed |
+| 2. `_shared_state` global | Accepted risk | Low risk for single-model use case |
+| 3. `register_forward_pass_callable` | Design choice | Intentional one-iteration delay |
+| 4. `tokens_per_block` default | **Fixed in v1.1** | Added `or 32` fallback |
+| 5. Redundant override | **Fixed in v1.1** | Removed dead code |
+| 6. Broad exception catch | **Fixed in v1.1** | Narrowed to `RuntimeError`, re-raise OOM |
+
+Verified via QPS 6 regression testing: v1.1 completed 10/10 rounds at 100% success
+vs v1.0's 9/10 (crashed at round 10).
