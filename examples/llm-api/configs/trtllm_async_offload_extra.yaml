@@ -1,0 +1,43 @@
+# Example configuration for the async KV cache offload connector.
+#
+# This connector replaces TRT-LLM's native synchronous KV cache offloading
+# with a fully asynchronous implementation using dedicated CUDA streams.
+# It eliminates the "death spiral" failure mode where synchronous D2H/H2D
+# transfers block the compute stream under high QPS, causing cascading
+# request timeouts and GPU stalls.
+#
+# Usage with trtllm-serve:
+#   trtllm-serve serve <model> --backend pytorch --extra-config examples/llm-api/configs/trtllm_async_offload_extra.yaml
+#
+# Environment variables:
+#   ASYNC_OFFLOAD_CPU_GB  -- CPU pinned memory cache size in GB (default: 200)
+
+max_num_tokens: 4096
+max_seq_len: 8000
+max_batch_size: 64
+trust_remote_code: true
+backend: pytorch
+enable_chunked_prefill: true
+stream_interval: 5
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 64
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.9
+  enable_partial_reuse: true
+  enable_block_reuse: true
+  # NOTE: host_cache_size is intentionally NOT set here.
+  # Setting it would enable native secondary pool offloading, which uses
+  # synchronous blocking transfers. The async connector manages its own
+  # CPU memory pool via ASYNC_OFFLOAD_CPU_GB instead.
+  dtype: fp8
+
+kv_connector_config:
+  connector_module: tensorrt_llm._torch.pyexecutor.connectors.async_offload.connector
+  connector_scheduler_class: AsyncOffloadLeader
+  connector_worker_class: AsyncOffloadWorker
+
+return_perf_metrics: true
+enable_iter_perf_stats: true
