@@ -58,8 +58,12 @@ class AsyncOffloadWorker(KvCacheConnectorWorker):
                 dtype=kv_cache_tensor.dtype,
                 device='cpu',
             ).pin_memory()
-        except Exception:
-            logger.warning("Failed to allocate pinned fp8 CPU memory, using uint8 view")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                raise
+            logger.warning(
+                f"Failed to allocate pinned CPU memory for dtype "
+                f"{kv_cache_tensor.dtype}, falling back to uint8 view: {e}")
             total_elements = num_cpu_blocks
             for s in block_shape:
                 total_elements *= s
@@ -83,9 +87,6 @@ class AsyncOffloadWorker(KvCacheConnectorWorker):
 
     def register_forward_pass_callable(self):
         return None
-
-    def bind_connector_meta(self, metadata):
-        super().bind_connector_meta(metadata)
 
     def start_load_kv(self, stream: torch.cuda.Stream):
         meta = self._metadata
