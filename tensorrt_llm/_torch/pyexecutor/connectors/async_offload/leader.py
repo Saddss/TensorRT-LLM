@@ -77,7 +77,19 @@ class AsyncOffloadLeader(KvCacheConnectorScheduler):
         matched = self.block_pool.find_prefix_match(block_hashes, start_block)
 
         if matched > 0:
+            prompt_len = len(tokens)
             matched_tokens = matched * tpb
+
+            # Guard: prepopulatedPromptLen must be < promptLen,
+            # otherwise TRT-LLM has no new tokens to prefill → assertion failure.
+            total_matched = num_computed_tokens + matched_tokens
+            if total_matched >= prompt_len:
+                max_cpu_tokens = prompt_len - num_computed_tokens - 1
+                matched = max_cpu_tokens // tpb
+                matched_tokens = matched * tpb
+                if matched <= 0:
+                    return (0, False)
+
             self.pending_loads[request.request_id] = {
                 'start_block': start_block,
                 'num_blocks': matched,
