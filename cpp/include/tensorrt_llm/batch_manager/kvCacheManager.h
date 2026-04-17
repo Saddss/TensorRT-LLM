@@ -791,6 +791,18 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Retrospectively invalidate any cached blocks matching the given token prefix.
+    //! \details Walks the radix tree starting from \c mCachedBlocksRoot, following the
+    //!          prefix token-block chain. Prunes the deepest matched block whose subtree
+    //!          is entirely idle (\c hasRefs() == false on the matched block) along with
+    //!          all of its descendants. Blocks currently in use by an active sequence are
+    //!          left untouched, as are partial (non-full-block) tails of the prefix.  This
+    //!          is the radix-tree primitive backing the `invalidatePrefix` REST endpoint
+    //!          added for Issue #13080.
+    //! \param prefixTokens Token IDs representing the prompt prefix to invalidate.
+    //!                     Extra IDs default to 0 and LoRA task id is left unset.
+    void invalidatePrefix(VecTokens const& prefixTokens);
+
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1299,6 +1311,10 @@ public:
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
+
+    //! \brief Forward invalidatePrefix to every WindowBlockManager.  See
+    //!        WindowBlockManager::invalidatePrefix for semantics.
+    void invalidatePrefix(VecTokens const& prefixTokens);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1860,6 +1876,14 @@ public:
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false)
         = 0;
 
+    //! \brief Retrospectively invalidate any cached KV blocks matching the
+    //! supplied prompt prefix.
+    //! \details Removes the deepest idle radix-tree entry matching the prefix
+    //!          (and all descendants) so future lookups will miss.  Blocks
+    //!          currently claimed by an active sequence are left untouched.
+    //!          Added for Issue #13080.
+    virtual void invalidatePrefix(VecTokens const& prefixTokens) = 0;
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -2255,6 +2279,10 @@ public:
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false) override;
+
+    //! \brief Retrospectively invalidate cached KV blocks for a prompt prefix
+    //! (Issue #13080).  Forwards to \c BlockManager::invalidatePrefix.
+    void invalidatePrefix(VecTokens const& prefixTokens) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

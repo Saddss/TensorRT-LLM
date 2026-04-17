@@ -1352,6 +1352,90 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
     return std::nullopt;
 }
 
+void BlockManager::invalidatePrefix(VecTokens const& prefixTokens)
+{
+    // Fan out to every per-window manager.  A given prefix may be cached in
+    // several window sizes (e.g. full attention + a sliding window), so we
+    // invalidate in all of them to keep the cache consistent.
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        manager.invalidatePrefix(prefixTokens);
+    }
+}
+
+void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
+{
+    // Empty prefix: no-op (matches the tree root, which we must not prune).
+    if (prefixTokens.empty())
+    {
+        return;
+    }
+    // Build block keys from the prefix; partial blocks at the tail are dropped
+    // because only full-block entries are stored in the radix tree.
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<TokenIdType>(prefixTokens, prefixTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+    if (blockedUniqueTokens.empty())
+    {
+        return;
+    }
+
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedUniqueTokens.size());
+    for (auto const& blockTokens : blockedUniqueTokens)
+    {
+        // No LoRA scoping, no multimodal extra keys, no cache salt — this is the
+        // "plain text prefix" invalidation path.  Matches (requestId=*, lora=*)
+        // across the tree.
+        blockKeys.emplace_back(blockTokens);
+    }
+
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto searchRoot = mCachedBlocksRoot;
+    BlockPtr deepestIdleMatch = nullptr;
+    SizeType32 matchedDepth = 0;
+
+    for (auto const& blockKey : blockKeys)
+    {
+        if (searchRoot == nullptr)
+        {
+            break;
+        }
+        auto [partialMatch, numMatched, matchingBlock]
+            = searchRoot->findMatchingBlock(blockKey, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false);
+        if (matchingBlock == nullptr)
+        {
+            break;
+        }
+        // Refuse to prune blocks still held by an active sequence — cutting
+        // them out mid-flight would starve the sequence of its own lineage
+        // during its subsequent releaseBlocks -> storeBlocks call.  Stop the
+        // descent here; anything deeper would also be "shared" from this
+        // block's perspective.
+        if (matchingBlock->hasRefs())
+        {
+            break;
+        }
+        deepestIdleMatch = matchingBlock;
+        ++matchedDepth;
+        searchRoot = std::move(matchingBlock);
+    }
+
+    if (deepestIdleMatch)
+    {
+        TLLM_LOG_DEBUG("%s::invalidatePrefix - pruning block %d (depth=%d/%zu) and all descendants", mLogPrefix.c_str(),
+            deepestIdleMatch->getBlockId(), matchedDepth, blockKeys.size());
+        // Detach from the radix tree.  The block stays in the eviction policy's
+        // free queue (no refs), so it will be handed out to the next allocation
+        // but can no longer be found by a prefix lookup.
+        deepestIdleMatch->freeBlockAndAllDescendants();
+    }
+    else
+    {
+        TLLM_LOG_DEBUG(
+            "%s::invalidatePrefix - no idle match for prefix of %zu tokens", mLogPrefix.c_str(), prefixTokens.size());
+    }
+}
+
 SizeType32 WindowBlockManager::countReusableBlocks(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
@@ -3175,14 +3259,29 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
         return mSequences.extract(requestId);
     }();
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+    // Issue #13080: `no_cache_on_finish` short-circuits the store-for-reuse path.
+    // When the caller flags a request as "do not cache on finish", we release its
+    // KV blocks without pushing them into the reuse radix tree even if block
+    // reuse is globally enabled.  This is the prospective-prevention counterpart
+    // to invalidatePrefix (retrospective cleanup) and is driven by multi-turn
+    // chat clients who already know their current prefix is about to be
+    // truncated and would otherwise leave stale entries in the cache.
+    bool const noCacheOnFinish = llmRequest.has_value() && llmRequest->getNoCacheOnFinish();
     if (!sequenceNode.empty())
     {
-        if (mEnableBlockReuse)
+        if (mEnableBlockReuse && !noCacheOnFinish)
         {
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), llmRequest, pinBlocks);
         }
         else
         {
+            if (noCacheOnFinish)
+            {
+                TLLM_LOG_DEBUG(
+                    "[%s] removeSequence(requestId=%lu): no_cache_on_finish=true, "
+                    "skipping storeBlocksForReuse",
+                    isCrossKv() ? "CROSS" : "SELF", requestId);
+            }
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, pinBlocks);
         }
     }
@@ -3204,6 +3303,19 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return pinnedBlockIds;
+}
+
+void KVCacheManager::invalidatePrefix(VecTokens const& prefixTokens)
+{
+    TLLM_LOG_TRACE(
+        "[%s]::%s start (prefix_len=%zu)", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__, prefixTokens.size());
+    if (!mEnableBlockReuse)
+    {
+        TLLM_LOG_DEBUG("invalidatePrefix: block reuse disabled, nothing to invalidate");
+        return;
+    }
+    mBlockManager.invalidatePrefix(prefixTokens);
+    TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
 }
 
 void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
