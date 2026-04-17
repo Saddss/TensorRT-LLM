@@ -890,6 +890,22 @@ public:
         mMaxSentTokenLen = maxSentLength;
     }
 
+    /// @brief Whether this request has been flagged to skip KV-block reuse
+    /// storage when the sequence finishes.  See Issue #13080
+    /// (`no_cache_on_finish`).  Consumed by KVCacheManager::removeSequence.
+    [[nodiscard]] bool getNoCacheOnFinish() const noexcept
+    {
+        return mNoCacheOnFinish;
+    }
+
+    /// @brief Flag/unflag this request as "do-not-cache-on-finish".  When
+    /// true, KVCacheManager::removeSequence() skips the storeBlocksForReuse
+    /// path for this request and releases blocks directly.
+    void setNoCacheOnFinish(bool flag) noexcept
+    {
+        mNoCacheOnFinish = flag;
+    }
+
     [[nodiscard]] std::optional<TensorPtr> getPromptEmbeddingTable() const
     {
         return mPromptEmbeddingTable;
@@ -2137,6 +2153,14 @@ protected:
     bool mIsDummyRequest{false};
 
     bool mUseDraftModel{false};
+
+    // If set, the request's KV blocks are NOT stored into the reuse radix tree
+    // when the sequence finishes.  Used for prospective prevention of caching
+    // soon-to-be-truncated prefixes in multi-turn conversations (Issue #13080,
+    // `no_cache_on_finish`).  Toggle via setNoCacheOnFinish(); consumed by
+    // KVCacheManager::removeSequence() to decide whether to call
+    // storeBlocksForReuse or to release the blocks outright.
+    bool mNoCacheOnFinish{false};
 
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
