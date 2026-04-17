@@ -622,6 +622,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
+            no_cache_on_finish: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -711,6 +712,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_disaggregated_params = None
 
         self.py_num_connector_matched_tokens = 0
+
+        # Issue #13080: propagate the "do-not-cache-on-finish" flag into the
+        # C++ GenericLlmRequest so KVCacheManager::removeSequence can consult
+        # it during teardown without any Python round-trip.
+        if no_cache_on_finish:
+            self.no_cache_on_finish = True
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -1024,6 +1031,11 @@ def executor_request_to_llm_request(
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
+        # Issue #13080: propagate "do-not-cache-on-finish" from the executor
+        # request (set by openai_server when the client passes
+        # extra_body.trtllm_no_cache_on_finish=true).
+        no_cache_on_finish=getattr(executor_request, "py_no_cache_on_finish",
+                                   False),
     )
 
     llm_request.py_original_end_id = getattr(executor_request,

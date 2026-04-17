@@ -875,6 +875,16 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
+    def invalidate_prefix(self, prefix_tokens):
+        """Retrospectively evict cached KV blocks matching a prompt prefix.
+
+        Thin forwarder to the C++ ``BaseKVCacheManager::invalidatePrefix`` path
+        added for Issue #13080.  ``prefix_tokens`` is an iterable of integer
+        token IDs.  When block reuse is disabled or no idle radix-tree entry
+        matches the prefix, the call is a silent no-op.
+        """
+        return self.impl.invalidate_prefix(list(prefix_tokens))
+
     @staticmethod
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,

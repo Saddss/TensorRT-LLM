@@ -157,6 +157,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
 
+    def invalidate_kv_prefix(self, prefix_tokens) -> bool:
+        """Forward invalidate_kv_prefix to the RPC worker.  Issue #13080."""
+        if self.rpc_client is None:
+            logger.warning(
+                "[proxy] invalidate_kv_prefix: rpc_client not initialized")
+            return False
+        try:
+            result = self.rpc_client.invalidate_kv_prefix(
+                prefix_tokens=list(prefix_tokens)).remote()
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"[proxy] invalidate_kv_prefix RPC raised: {e!r}")
+            return False
+
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context

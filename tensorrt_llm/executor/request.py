@@ -106,6 +106,7 @@ class GenerationRequest:
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        no_cache_on_finish: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -134,6 +135,10 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
         self.arrival_time = arrival_time
+        # Issue #13080: prospective no-cache-on-finish flag, forwarded to the
+        # GenericLlmRequest::mNoCacheOnFinish field via
+        # executor_request.py_no_cache_on_finish.
+        self.no_cache_on_finish = no_cache_on_finish
         if not (0.0 <= priority <= 1.0):
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")

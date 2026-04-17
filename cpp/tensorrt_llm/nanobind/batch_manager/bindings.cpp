@@ -110,6 +110,8 @@ void initBindings(nb::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, nb::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, nb::arg("max_input_len"))
         .def_prop_rw("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
+        // Issue #13080: prospective prevention of KV-cache-on-finish for this request.
+        .def_prop_rw("no_cache_on_finish", &GenLlmReq::getNoCacheOnFinish, &GenLlmReq::setNoCacheOnFinish)
         .def_prop_ro("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
         .def_prop_ro("multimodal_embedding", &GenLlmReq::getMultimodalEmbedding)
         .def_prop_ro("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
