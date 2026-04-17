@@ -387,6 +387,13 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    # Issue #13080 TensorRT-LLM extension: see ChatCompletionRequest.
+    trtllm_no_cache_on_finish: Optional[bool] = Field(
+        default=False,
+        description=("TensorRT-LLM extension.  If true, this request's KV "
+                     "blocks are NOT stored for reuse when the sequence "
+                     "finishes (Issue #13080, prospective prevention)."))
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -748,6 +755,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+
+    # Issue #13080: TensorRT-LLM-specific extension.  When true, the KV blocks
+    # produced by this request will NOT be stored in the reuse radix tree
+    # when the request finishes.  Intended for multi-turn chat clients that
+    # know a given turn is about to be truncated from future prompts.
+    trtllm_no_cache_on_finish: Optional[bool] = Field(
+        default=False,
+        description=("TensorRT-LLM extension.  If true, this request's KV "
+                     "blocks are NOT stored for reuse when the sequence "
+                     "finishes (Issue #13080, prospective prevention)."))
 
     # doc: end-chat-completion-extra-params
 

@@ -584,6 +584,12 @@ class OpenAIServer:
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        # Issue #13080: retrospective prefix eviction.  POST a JSON body of
+        # the form {"prefix_tokens": [int, int, ...]} and the server will
+        # prune any matching idle radix-tree entries.
+        self.app.add_api_route("/v1/kv_cache/invalidate_prefix",
+                               self.invalidate_kv_cache_prefix,
+                               methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -889,6 +895,44 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
+    async def invalidate_kv_cache_prefix(
+        self, body: dict = Body(...)) -> JSONResponse:
+        """Retrospectively evict cached KV blocks matching a token prefix.
+
+        Body schema::
+
+            {"prefix_tokens": [int, ...]}
+
+        Returns::
+
+            {"dispatched": bool, "prefix_len": int}
+
+        ``dispatched`` is ``True`` when the call reached the pytorch
+        KVCacheManager.  It does NOT guarantee anything was actually pruned
+        (e.g. the prefix may not be cached, or every matching block may
+        still be held by an active sequence).  Added for Issue #13080.
+        """
+        prefix_tokens = body.get("prefix_tokens")
+        if not isinstance(prefix_tokens, list) or not all(
+                isinstance(t, int) for t in prefix_tokens):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error":
+                    "prefix_tokens must be a non-empty list of integers"
+                })
+        dispatched = False
+        try:
+            dispatched = bool(
+                self.generator.invalidate_kv_prefix(prefix_tokens))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"invalidate_kv_cache_prefix failed: {exc}")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        return JSONResponse(content={
+            "dispatched": dispatched,
+            "prefix_len": len(prefix_tokens),
+        })
+
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
@@ -1137,6 +1181,8 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                no_cache_on_finish=bool(
+                    getattr(request, "trtllm_no_cache_on_finish", False)),
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1415,7 +1461,9 @@ class OpenAIServer:
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
-                    trace_headers=trace_headers)
+                    trace_headers=trace_headers,
+                    no_cache_on_finish=bool(
+                        getattr(request, "trtllm_no_cache_on_finish", False)))
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
