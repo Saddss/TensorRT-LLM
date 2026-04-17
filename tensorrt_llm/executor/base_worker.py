@@ -314,6 +314,33 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_kv_cache_events()
 
+    def invalidate_kv_prefix(self, prefix_tokens) -> bool:
+        """Retrospectively evict cached KV blocks matching a token prefix.
+
+        Only supported on the pytorch backend (PyExecutor + KVCacheManager).
+        For TRT-engine executors the call is a silent no-op so the REST path
+        stays safe to invoke unconditionally.  Added for Issue #13080.
+
+        Returns ``True`` when the call reached the pytorch KVCacheManager,
+        ``False`` otherwise (wrong backend / no KV manager attached).
+        """
+        if isinstance(self.engine, tllm.Executor):
+            logger.debug("invalidate_kv_prefix: TRT Executor backend, no-op")
+            return False
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            ResourceManagerType
+        resource_mgr = getattr(self.engine, "resource_manager", None)
+        if resource_mgr is None:
+            return False
+        kv_mgr = resource_mgr.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_mgr is None or not hasattr(kv_mgr, "invalidate_prefix"):
+            return False
+        kv_mgr.invalidate_prefix(list(prefix_tokens))
+        logger.debug(
+            f"invalidate_kv_prefix: dispatched {len(prefix_tokens)} tokens")
+        return True
+
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None
@@ -587,6 +614,13 @@ class BaseWorker(GenerationExecutor):
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
+
+            # Issue #13080: forward the no-cache-on-finish flag to the
+            # PyTorch backend so GenericLlmRequest::mNoCacheOnFinish gets set
+            # before the request is scheduled.
+            if self._is_pytorch_backend and getattr(
+                    request, "no_cache_on_finish", False):
+                executor_request.py_no_cache_on_finish = True
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

@@ -422,6 +422,7 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        no_cache_on_finish: bool = False,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -496,6 +497,7 @@ class BaseLLM:
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
             priority=priority,
+            no_cache_on_finish=no_cache_on_finish,
         )
 
         if sampling_params.return_perf_metrics:
@@ -716,7 +718,7 @@ class BaseLLM:
 
     @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
-        '''Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
 
         Args:
@@ -725,12 +727,12 @@ class BaseLLM:
         Returns:
             List[dict]: A list of runtime stats as dicts.
                 e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
-        '''
+        """
         return self._executor.get_stats(timeout=timeout)
 
     @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
-        '''Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
         after prompts have been submitted.
 
@@ -739,12 +741,12 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.
-        '''
+        """
         return self._executor.aget_stats(timeout=timeout)
 
     @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
-        '''Get iteration KV events from the runtime.
+        """Get iteration KV events from the runtime.
 
         KV events are used to track changes and operations within the KV Cache. Types of events:
             - KVCacheCreatedData: Indicates the creation of cache blocks.
@@ -761,14 +763,32 @@ class BaseLLM:
 
         Returns:
             List[dict]: A list of runtime events as dict.
-        '''
+        """
         return self._executor.get_kv_events(timeout=timeout)
+
+    @set_api_status("beta")
+    def invalidate_kv_prefix(self, prefix_tokens) -> bool:
+        """Retrospectively evict cached KV blocks matching a prompt prefix.
+
+        Thin wrapper over ``GenerationExecutor.invalidate_kv_prefix`` added
+        for Issue #13080. ``prefix_tokens`` is an iterable of integer token
+        IDs representing the exact token stream whose radix-tree entries
+        should be pruned.  Returns ``True`` when the call reached a pytorch
+        KVCacheManager, ``False`` otherwise (wrong backend or unsupported).
+
+        Notes:
+            - Only full-block multiples of ``tokens_per_block`` participate;
+              a partial-block tail is implicitly dropped.
+            - Blocks currently held by an active sequence are left untouched.
+            - No-op when block reuse is globally disabled.
+        """
+        return self._executor.invalidate_kv_prefix(prefix_tokens)
 
     @set_api_status("beta")
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:
-        '''Get iteration KV events from the runtime.
+        """Get iteration KV events from the runtime.
 
         KV events are used to track changes and operations within the KV Cache. Types of events:
             - KVCacheCreatedData: Indicates the creation of cache blocks.
@@ -785,7 +805,7 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
-        '''
+        """
         return self._executor.aget_kv_events(timeout=timeout)
 
     def _process_env_overrides(self,

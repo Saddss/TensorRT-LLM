@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 36);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 37);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -138,6 +138,11 @@ public:
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
+    }
+
+    void invalidatePrefix(tbk::VecTokens const& prefixTokens) override
+    {
+        NB_OVERRIDE_PURE(invalidatePrefix, prefixTokens);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -556,6 +561,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_prefix", &BaseKVCacheManager::invalidatePrefix, nb::arg("prefix_tokens"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Retrospectively invalidate cached KV blocks matching prefix_tokens.\n"
+            "See Issue #13080.  No-op when block reuse is disabled or when the\n"
+            "deepest matched block is still held by an active sequence.")
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
         .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),

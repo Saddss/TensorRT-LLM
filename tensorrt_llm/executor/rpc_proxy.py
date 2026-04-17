@@ -186,6 +186,16 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
 
+    def invalidate_kv_prefix(self, prefix_tokens) -> bool:
+        """Forward invalidate_kv_prefix to the RPC worker.  Issue #13080."""
+        try:
+            result = self.rpc_client.invalidate_kv_prefix(
+                prefix_tokens=list(prefix_tokens)).remote()
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"[proxy] invalidate_kv_prefix RPC raised: {e!r}")
+            return False
+
     def shutdown(self):
         if self._shutdown_event.is_set():
             return
