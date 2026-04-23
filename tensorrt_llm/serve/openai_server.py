@@ -899,9 +899,13 @@ class OpenAIServer:
         self, body: dict = Body(...)) -> JSONResponse:
         """Retrospectively evict cached KV blocks matching a token prefix.
 
-        Body schema::
+        Body schema (accepts one of)::
 
-            {"prefix_tokens": [int, ...]}
+            {"prefix_tokens": [int, ...]}      # pre-tokenized  (original API)
+            {"prefix_text":   "<prompt>"}      # bench extension: server tokenizes
+            {"prefix_messages": [...]}         # bench extension: chat messages
+                                               #   tokenized with the model's
+                                               #   chat template
 
         Returns::
 
@@ -913,13 +917,38 @@ class OpenAIServer:
         still be held by an active sequence).  Added for Issue #13080.
         """
         prefix_tokens = body.get("prefix_tokens")
+        # Bench ergonomic extension: accept text/messages so clients without
+        # an HF tokenizer can use the endpoint. Tokenization happens here on
+        # the same tokenizer/chat-template the inference path already uses, so
+        # the token sequence is guaranteed to match whatever prefix was left
+        # behind in the KV radix tree.
+        if prefix_tokens is None:
+            prefix_text = body.get("prefix_text")
+            prefix_messages = body.get("prefix_messages")
+            try:
+                if prefix_text is not None and isinstance(prefix_text, str):
+                    prefix_tokens = list(
+                        self.tokenizer(prefix_text,
+                                       add_special_tokens=False).input_ids)
+                elif isinstance(prefix_messages, list) and prefix_messages:
+                    prefix_tokens = list(
+                        self.tokenizer.apply_chat_template(
+                            prefix_messages,
+                            add_generation_prompt=False,
+                            tokenize=True))
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"tokenization failed: {exc}"})
+
         if not isinstance(prefix_tokens, list) or not all(
                 isinstance(t, int) for t in prefix_tokens):
             return JSONResponse(
                 status_code=400,
                 content={
                     "error":
-                    "prefix_tokens must be a non-empty list of integers"
+                    "expected one of: non-empty prefix_tokens (list[int]), "
+                    "prefix_text (str), or prefix_messages (list[chat msg])"
                 })
         dispatched = False
         try:
