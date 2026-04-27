@@ -1391,8 +1391,13 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
 
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
-    BlockPtr deepestIdleMatch = nullptr;
-    SizeType32 matchedDepth = 0;
+    // Collect every idle matched block on the prefix path so we can prune the
+    // entire chain, not just the deepest leaf.  The truncation use-case is
+    // "this whole prefix is now stale" — releasing only the deepest match
+    // leaves all the ancestor blocks still findable by a prefix lookup, which
+    // is exactly what we are trying to prevent.
+    std::vector<BlockPtr> idleChain;
+    idleChain.reserve(blockKeys.size());
 
     for (auto const& blockKey : blockKeys)
     {
@@ -1415,19 +1420,38 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
         {
             break;
         }
-        deepestIdleMatch = matchingBlock;
-        ++matchedDepth;
+        idleChain.push_back(matchingBlock);
         searchRoot = std::move(matchingBlock);
     }
 
-    if (deepestIdleMatch)
+    if (!idleChain.empty())
     {
-        TLLM_LOG_DEBUG("%s::invalidatePrefix - pruning block %d (depth=%d/%zu) and all descendants", mLogPrefix.c_str(),
-            deepestIdleMatch->getBlockId(), matchedDepth, blockKeys.size());
-        // Detach from the radix tree.  The block stays in the eviction policy's
-        // free queue (no refs), so it will be handed out to the next allocation
-        // but can no longer be found by a prefix lookup.
-        deepestIdleMatch->freeBlockAndAllDescendants();
+        TLLM_LOG_DEBUG(
+            "%s::invalidatePrefix - pruning %zu blocks on the matched prefix chain (full prefix has %zu blocks)",
+            mLogPrefix.c_str(), idleChain.size(), blockKeys.size());
+        // First detach the deepest block's descendants — these are blocks
+        // hanging off the end of the matched prefix that are not in the
+        // chain themselves (e.g. cached generation tokens, or another
+        // request's continuation that re-used this prefix).  We treat them
+        // as stale data that should disappear together with the prefix.
+        idleChain.back()->detachDescendantsFromLookupTree();
+        // Then detach each block on the matched chain individually,
+        // deepest-first.  Crucially we do NOT call freeBlockAndAllDescendants
+        // here: that would also drop sibling subtrees attached to ancestor
+        // lookup nodes (e.g. another conversation that shares the same
+        // system-prompt prefix at the top of the chain), which would be a
+        // catastrophic over-prune.  detachFromLookupNode only clears the
+        // block's own value slot; the lookup tree's cascade-prune logic
+        // automatically removes ancestor nodes that become empty, while
+        // leaving any node that still has sibling children intact.
+        //
+        // The blocks themselves remain in the eviction policy's free queue
+        // (no refs), so they will be handed out to the next allocation — they
+        // just can no longer be found by a prefix lookup.
+        for (auto it = idleChain.rbegin(); it != idleChain.rend(); ++it)
+        {
+            (*it)->detachFromLookupNode();
+        }
     }
     else
     {
