@@ -76,7 +76,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         ? std::make_shared<std::vector<TokenIdType>>(*mEncoderTokens.value().get())
         : nullptr;
     auto const optEncoderInputTokens = std::optional<std::shared_ptr<std::vector<TokenIdType>>>(encoderInputTokens);
-    return std::make_shared<tb::LlmRequest>(                       //
+    auto result = std::make_shared<tb::LlmRequest>(                 //
         mRequestId,                                                //
         mMaxNewTokens,                                             //
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), //
@@ -130,4 +130,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mCacheSaltID,                                              //
         mPerfMetrics.timingMetrics.arrivalTime                     //
     );
+    result->setNoCacheOnFinish(getNoCacheOnFinish());
+    return result;
 }
