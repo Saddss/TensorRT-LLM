@@ -3857,9 +3857,27 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     if (found)
     {
         auto& sequence = getSequence(requestId);
-        if (mEnableBlockReuse && !llmRequest.isDummyRequest())
+        // Issue #13080: when the caller flagged this request with
+        // no_cache_on_finish, do not register its context blocks into the
+        // reuse radix tree.  Without this gate, PR #13029's
+        // store_context_blocks step (called by the PyExecutor at the end of
+        // every batch step on every still-running context request) would
+        // already have inserted the prompt blocks into the tree, well before
+        // removeSequence's NCOF short-circuit gets a chance to skip the
+        // store-for-reuse path.  The two changes together — gating the
+        // prospective insert here and gating the retrospective insert in
+        // removeSequence — ensure NCOF really keeps the prompt out of the
+        // reuse cache.
+        if (mEnableBlockReuse && !llmRequest.isDummyRequest() && !llmRequest.getNoCacheOnFinish())
         {
             mBlockManager.storeContextBlocks(sequence, llmRequest);
+        }
+        else if (llmRequest.getNoCacheOnFinish())
+        {
+            TLLM_LOG_DEBUG(
+                "storeContextBlocks: skipping radix-tree insert for request %lu "
+                "because no_cache_on_finish=true",
+                requestId);
         }
     }
     else
