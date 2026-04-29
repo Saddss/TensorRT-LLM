@@ -142,7 +142,7 @@ class _StrategyImpls:
                 temperature,
                 enable_pdl=get_env_enable_pdl(),
             )
-            return _StrategyImpls.BaseMixin._sanitize_probs(probs)
+            return _StrategyImpls.StrategyImpl._sanitize_probs(probs)
 
         @classmethod
         def _sample_from_probs(
