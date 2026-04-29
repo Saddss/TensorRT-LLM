@@ -1467,10 +1467,17 @@ void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, 
         return;
     }
 
+    // Match storeBlocksForReuse/findNewContextBlock semantics: the last token
+    // cannot be recovered from KV cache, so reusable keys are built from
+    // token_count - 1 and may include a partial tail block.  Using full-block
+    // only keys here misses exactly the branch we are trying to prune when the
+    // stale prompt ends in a partial block.
+    auto const previousUsable = previousTokens.empty() ? 0 : previousTokens.size() - 1;
+    auto const currentUsable = currentTokens.empty() ? 0 : currentTokens.size() - 1;
     auto previousBlockList
-        = chopVectorIntoBlocks<TokenIdType>(previousTokens, previousTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+        = chopVectorIntoBlocks<TokenIdType>(previousTokens, previousUsable, mTokensPerBlock, /*allowPartial=*/true);
     auto currentBlockList
-        = chopVectorIntoBlocks<TokenIdType>(currentTokens, currentTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+        = chopVectorIntoBlocks<TokenIdType>(currentTokens, currentUsable, mTokensPerBlock, /*allowPartial=*/true);
     std::vector<std::vector<TokenIdType>> previousBlocks(previousBlockList.begin(), previousBlockList.end());
     std::vector<std::vector<TokenIdType>> currentBlocks(currentBlockList.begin(), currentBlockList.end());
     if (previousBlocks.empty())
