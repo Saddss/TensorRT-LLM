@@ -2109,6 +2109,19 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
+                    if sample_state is None:
+                        logger.error(
+                            "Sampling failed for scheduled batch; failed requests were isolated"
+                        )
+                        self.perf_manager.save_timing_to_requests(
+                            scheduled_batch.all_requests(), gpu_forward_start,
+                            gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                            fwd_timing.end_time, sample_timing.start_time,
+                            sample_timing.end_time)
+                        self._handle_canceled_requests()
+                        finished_requests = self._handle_responses()
+                        continue
+
                     self.perf_manager.save_timing_to_requests(
                         scheduled_batch.all_requests(), gpu_forward_start,
                         gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
@@ -2400,14 +2413,19 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
-                    assert sample_state is not None, "Sampling failed"
+                    if sample_state is None:
+                        logger.error(
+                            "Sampling failed for scheduled batch; failed requests were isolated"
+                        )
+                        can_queue = False
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
-                    self._update_request_states(scheduled_batch)
+                    if can_queue:
+                        self._update_request_states(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
@@ -3431,7 +3449,10 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            self._handle_errors(error_msg,
+                                requests=list(
+                                    scheduled_batch.all_requests()))
+            return None
 
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):
@@ -3441,7 +3462,8 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            self._handle_errors(error_msg,
+                                requests=list(requests.all_requests()))
 
     @nvtx_range("_update_requests")
     def _update_requests(self,
@@ -3453,7 +3475,9 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            failed_requests = list(
+                sample_state.requests) if sample_state else None
+            self._handle_errors(error_msg, requests=failed_requests)
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
