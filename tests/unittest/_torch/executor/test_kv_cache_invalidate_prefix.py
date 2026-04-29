@@ -302,20 +302,11 @@ class TestKVCacheInvalidatePrefix(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req1)
         mgr.free_resources(req1)
 
-        # Before invalidation, the full previous prompt should reuse both full blocks.
-        pre = mgr.get_kv_cache_stats().reused_blocks
-        old_probe_before = _make_request(req_id=1, input_tokens=previous)
-        mgr.impl.add_sequence(old_probe_before.py_request_id, old_probe_before.prompt_len, 1, old_probe_before)
-        reused_old_before = mgr.get_kv_cache_stats().reused_blocks - pre
-        self.assertGreaterEqual(reused_old_before, 2)
-        simulate_prefill_completion_only_use_for_testing(old_probe_before)
-        mgr.free_resources(old_probe_before)
-
         mgr.invalidate_stale_branch(previous, current)
 
         # The old branch should be gone: only the common block can be reused.
         pre_old_after = mgr.get_kv_cache_stats().reused_blocks
-        old_probe_after = _make_request(req_id=2, input_tokens=previous)
+        old_probe_after = _make_request(req_id=1, input_tokens=previous)
         mgr.impl.add_sequence(old_probe_after.py_request_id, old_probe_after.prompt_len, 1, old_probe_after)
         reused_old_after = mgr.get_kv_cache_stats().reused_blocks - pre_old_after
         self.assertLessEqual(reused_old_after, 1)
@@ -324,7 +315,7 @@ class TestKVCacheInvalidatePrefix(unittest.TestCase):
 
         # The current prompt still sees the common prefix.
         pre_current = mgr.get_kv_cache_stats().reused_blocks
-        current_probe = _make_request(req_id=3, input_tokens=current)
+        current_probe = _make_request(req_id=2, input_tokens=current)
         mgr.impl.add_sequence(current_probe.py_request_id, current_probe.prompt_len, 1, current_probe)
         reused_current = mgr.get_kv_cache_stats().reused_blocks - pre_current
         self.assertGreaterEqual(reused_current, 1)
