@@ -1467,10 +1467,12 @@ void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, 
         return;
     }
 
-    auto previousBlocks
+    auto previousBlockList
         = chopVectorIntoBlocks<TokenIdType>(previousTokens, previousTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
-    auto currentBlocks
+    auto currentBlockList
         = chopVectorIntoBlocks<TokenIdType>(currentTokens, currentTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+    std::vector<std::vector<TokenIdType>> previousBlocks(previousBlockList.begin(), previousBlockList.end());
+    std::vector<std::vector<TokenIdType>> currentBlocks(currentBlockList.begin(), currentBlockList.end());
     if (previousBlocks.empty())
     {
         return;
