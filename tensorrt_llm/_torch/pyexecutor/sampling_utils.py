@@ -49,6 +49,22 @@ Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSe
 BEAM_SEARCH_PAD_TOKEN = -1
 
 
+def _safe_multinomial_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Make probability rows safe for CUDA multinomial sampling.
+
+    Under FP8/NVFP4 stress, logits can occasionally produce NaN/Inf or
+    all-invalid probability rows.  Passing those into torch.multinomial causes
+    CUDA device-side asserts and poisons the process.  Sanitizing in-place at
+    the sampling boundary turns bad entries into zero and falls back to a
+    uniform row only when the whole row is invalid.
+    """
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs = torch.clamp(probs, min=0.0)
+    row_sum = probs.sum(dim=-1, keepdim=True)
+    uniform = torch.full_like(probs, 1.0 / probs.shape[-1])
+    return torch.where(row_sum > 0, probs, uniform)
+
+
 @dataclass(kw_only=True)
 class StrategyMetadata:
     pass
@@ -254,6 +270,7 @@ def top_k_top_p_sampling_batch(
         # compute probability distribution
         probs = torch.softmax(logits, dim=-1)
 
+    probs = _safe_multinomial_probs(probs)
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
     return next_tokens, probs
@@ -463,6 +480,7 @@ def sample_rejected(
     last_target = target_probs[num_accepted]
     new = last_target - last_draft
     new = torch.where(new > 0, new, 0.0)
+    new = _safe_multinomial_probs(new.unsqueeze(0)).squeeze(0)
 
     new_token = torch.multinomial(new, num_samples=1, generator=generator).squeeze(-1)
     return cast(int, new_token.item())

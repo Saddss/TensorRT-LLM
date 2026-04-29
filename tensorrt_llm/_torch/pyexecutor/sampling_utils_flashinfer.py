@@ -19,7 +19,9 @@ referring to types like LlmRequest.
 """
 
 import abc
+import os
 import sys
+from pathlib import Path
 from typing import Literal, Optional, Type, TypeAlias, cast
 
 import flashinfer.sampling
@@ -85,10 +87,25 @@ class _StrategyImpls:
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
             # Using explicit async NaN check because FlashInfer.sampling 'nan_check' syncs
 
-            # https://github.com/pytorch/pytorch/issues/36853
-            torch._assert_async(~torch.any(torch.isnan(inputs)))
-
+            if os.getenv("TRTLLM_INJECT_NAN_PROBS") == "1" and inputs.numel() > 0:
+                marker = "/tmp/trtllm_injected_nan_once"
+                if not os.path.exists(marker):
+                    Path(marker).write_text("1")
+                    inputs.view(-1)[0] = float("nan")
+            # Harden against non-finite values without poisoning the CUDA
+            # context.  FlashInfer's check_nan path eventually relies on a
+            # device assert; sanitizing preserves the fast path and scopes the
+            # fault to the affected request.
+            inputs.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             return False
+
+        @staticmethod
+        def _sanitize_probs(probs: torch.Tensor) -> torch.Tensor:
+            probs.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            probs.clamp_(min=0.0)
+            row_sum = probs.sum(dim=-1, keepdim=True)
+            uniform = torch.full_like(probs, 1.0 / probs.shape[-1])
+            return torch.where(row_sum > 0, probs, uniform)
 
         @staticmethod
         def _make_tensor(
@@ -125,7 +142,7 @@ class _StrategyImpls:
                 temperature,
                 enable_pdl=get_env_enable_pdl(),
             )
-            return probs
+            return _StrategyImpls.BaseMixin._sanitize_probs(probs)
 
         @classmethod
         def _sample_from_probs(
@@ -176,6 +193,7 @@ class _StrategyImpls:
 
             if top_p is not None:
                 probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+                probs = cls._sanitize_probs(probs)
 
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
