@@ -785,6 +785,17 @@ class BaseLLM:
         return self._executor.invalidate_kv_prefix(prefix_tokens)
 
     @set_api_status("beta")
+    def invalidate_kv_stale_branch(self, previous_tokens, current_tokens) -> bool:
+        """Evict only stale old-branch KV blocks beyond the visible common prefix.
+
+        ``previous_tokens`` is the old pre-truncation prompt and
+        ``current_tokens`` is the new visible prompt.  The backend preserves
+        their common full-block prefix and prunes only the previous-only branch.
+        """
+        return self._executor.invalidate_kv_stale_branch(previous_tokens,
+                                                        current_tokens)
+
+    @set_api_status("beta")
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:

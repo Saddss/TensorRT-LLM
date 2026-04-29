@@ -1363,6 +1363,14 @@ void BlockManager::invalidatePrefix(VecTokens const& prefixTokens)
     }
 }
 
+void BlockManager::invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens)
+{
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        manager.invalidateStaleBranch(previousTokens, currentTokens);
+    }
+}
+
 void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
 {
     // Empty prefix: no-op (matches the tree root, which we must not prune).
@@ -1450,6 +1458,85 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
         TLLM_LOG_DEBUG(
             "%s::invalidatePrefix - no idle match for prefix of %zu tokens", mLogPrefix.c_str(), prefixTokens.size());
     }
+}
+
+void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens)
+{
+    if (previousTokens.empty())
+    {
+        return;
+    }
+
+    auto previousBlocks
+        = chopVectorIntoBlocks<TokenIdType>(previousTokens, previousTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+    auto currentBlocks
+        = chopVectorIntoBlocks<TokenIdType>(currentTokens, currentTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+    if (previousBlocks.empty())
+    {
+        return;
+    }
+
+    size_t commonDepth = 0;
+    auto const commonLimit = std::min(previousBlocks.size(), currentBlocks.size());
+    while (commonDepth < commonLimit && previousBlocks[commonDepth] == currentBlocks[commonDepth])
+    {
+        ++commonDepth;
+    }
+
+    if (commonDepth >= previousBlocks.size())
+    {
+        // The previous prompt is fully contained in the current prompt at the
+        // full-block granularity; there is no previous-only branch to prune.
+        return;
+    }
+
+    std::vector<BlockKey> previousKeys;
+    previousKeys.reserve(previousBlocks.size());
+    for (auto const& blockTokens : previousBlocks)
+    {
+        previousKeys.emplace_back(blockTokens);
+    }
+
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto searchRoot = mCachedBlocksRoot;
+
+    for (size_t idx = 0; idx < commonDepth; ++idx)
+    {
+        if (searchRoot == nullptr)
+        {
+            return;
+        }
+        auto [partialMatch, numMatched, matchingBlock]
+            = searchRoot->findMatchingBlock(previousKeys[idx], /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false);
+        if (matchingBlock == nullptr)
+        {
+            return;
+        }
+        searchRoot = std::move(matchingBlock);
+    }
+
+    if (searchRoot == nullptr)
+    {
+        return;
+    }
+
+    auto [partialMatch, numMatched, staleBranch]
+        = searchRoot->findMatchingBlock(previousKeys[commonDepth], /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false);
+    if (staleBranch == nullptr)
+    {
+        return;
+    }
+    if (staleBranch->hasRefs())
+    {
+        TLLM_LOG_DEBUG("%s::invalidateStaleBranch - stale branch block %d at depth=%zu still active; no-op",
+            mLogPrefix.c_str(), staleBranch->getBlockId(), commonDepth + 1);
+        return;
+    }
+
+    TLLM_LOG_DEBUG("%s::invalidateStaleBranch - preserving %zu common blocks, pruning stale block %d "
+                   "(previous_blocks=%zu, current_blocks=%zu)",
+        mLogPrefix.c_str(), commonDepth, staleBranch->getBlockId(), previousBlocks.size(), currentBlocks.size());
+    staleBranch->freeBlockAndAllDescendants();
 }
 
 SizeType32 WindowBlockManager::countReusableBlocks(
@@ -3343,6 +3430,19 @@ void KVCacheManager::invalidatePrefix(VecTokens const& prefixTokens)
         return;
     }
     mBlockManager.invalidatePrefix(prefixTokens);
+    TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
+}
+
+void KVCacheManager::invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens)
+{
+    TLLM_LOG_TRACE("[%s]::%s start (previous_len=%zu, current_len=%zu)", isCrossKv() ? "CROSS" : "SELF",
+        __PRETTY_FUNCTION__, previousTokens.size(), currentTokens.size());
+    if (!mEnableBlockReuse)
+    {
+        TLLM_LOG_DEBUG("invalidateStaleBranch: block reuse disabled, nothing to invalidate");
+        return;
+    }
+    mBlockManager.invalidateStaleBranch(previousTokens, currentTokens);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
 }
 

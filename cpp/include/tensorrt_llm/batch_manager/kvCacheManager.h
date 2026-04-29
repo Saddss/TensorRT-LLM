@@ -802,6 +802,16 @@ public:
     //!                     Extra IDs default to 0 and LoRA task id is left unset.
     void invalidatePrefix(VecTokens const& prefixTokens);
 
+    //! \brief Retrospectively invalidate only the old branch that diverged from
+    //!        the current visible prompt.
+    //! \details Computes the common full-block prefix between \p previousTokens
+    //!          and \p currentTokens, preserves that common prefix, and prunes
+    //!          the first idle block on the previous-only branch plus all of its
+    //!          descendants.  This is the precise truncation cleanup primitive:
+    //!          the still-visible context remains reusable, while hidden old
+    //!          turns are removed from the radix tree.
+    void invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens);
+
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1314,6 +1324,9 @@ public:
     //! \brief Forward invalidatePrefix to every WindowBlockManager.  See
     //!        WindowBlockManager::invalidatePrefix for semantics.
     void invalidatePrefix(VecTokens const& prefixTokens);
+
+    //! \brief Forward invalidateStaleBranch to every WindowBlockManager.
+    void invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1883,6 +1896,10 @@ public:
     //!          Added for Issue #13080.
     virtual void invalidatePrefix(VecTokens const& prefixTokens) = 0;
 
+    //! \brief Retrospectively invalidate only the stale old branch beyond the
+    //! common full-block prefix of previous/current prompts.
+    virtual void invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens) = 0;
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -2282,6 +2299,10 @@ public:
     //! \brief Retrospectively invalidate cached KV blocks for a prompt prefix
     //! (Issue #13080).  Forwards to \c BlockManager::invalidatePrefix.
     void invalidatePrefix(VecTokens const& prefixTokens) override;
+
+    //! \brief Retrospectively invalidate only the old branch beyond the common
+    //! full-block prefix of previous/current prompts (Issue #13080).
+    void invalidateStaleBranch(VecTokens const& previousTokens, VecTokens const& currentTokens) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

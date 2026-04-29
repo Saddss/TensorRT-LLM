@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 37);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 38);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -143,6 +143,11 @@ public:
     void invalidatePrefix(tbk::VecTokens const& prefixTokens) override
     {
         NB_OVERRIDE_PURE(invalidatePrefix, prefixTokens);
+    }
+
+    void invalidateStaleBranch(tbk::VecTokens const& previousTokens, tbk::VecTokens const& currentTokens) override
+    {
+        NB_OVERRIDE_PURE(invalidateStaleBranch, previousTokens, currentTokens);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -566,6 +571,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             "Retrospectively invalidate cached KV blocks matching prefix_tokens.\n"
             "See Issue #13080.  No-op when block reuse is disabled or when the\n"
             "deepest matched block is still held by an active sequence.")
+        .def("invalidate_stale_branch", &BaseKVCacheManager::invalidateStaleBranch, nb::arg("previous_tokens"),
+            nb::arg("current_tokens"), nb::call_guard<nb::gil_scoped_release>(),
+            "Retrospectively invalidate the previous-only branch beyond the\n"
+            "common full-block prefix of previous_tokens/current_tokens.")
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
         .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),

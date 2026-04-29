@@ -590,6 +590,9 @@ class OpenAIServer:
         self.app.add_api_route("/v1/kv_cache/invalidate_prefix",
                                self.invalidate_kv_cache_prefix,
                                methods=["POST"])
+        self.app.add_api_route("/v1/kv_cache/invalidate_stale_branch",
+                               self.invalidate_kv_cache_stale_branch,
+                               methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -960,6 +963,59 @@ class OpenAIServer:
         return JSONResponse(content={
             "dispatched": dispatched,
             "prefix_len": len(prefix_tokens),
+        })
+
+    def _tokens_from_kv_body(self, body: dict, tokens_key: str,
+                             text_key: str):
+        tokens = body.get(tokens_key)
+        if isinstance(tokens, list) and all(isinstance(t, int) for t in tokens):
+            return tokens
+        text = body.get(text_key)
+        if isinstance(text, str):
+            return self.tokenizer.tokenizer.encode(text, add_special_tokens=True)
+        return None
+
+    async def invalidate_kv_cache_stale_branch(
+        self, body: dict = Body(...)) -> JSONResponse:
+        """Evict only the previous-only branch beyond the current visible prompt.
+
+        Body schema accepts either token lists or raw rendered prompt strings::
+
+            {
+              "previous_tokens": [int, ...],
+              "current_tokens": [int, ...]
+            }
+
+        or::
+
+            {
+              "previous_prefix_text": "...",
+              "current_prefix_text": "..."
+            }
+        """
+        previous_tokens = self._tokens_from_kv_body(
+            body, "previous_tokens", "previous_prefix_text")
+        current_tokens = self._tokens_from_kv_body(
+            body, "current_tokens", "current_prefix_text")
+        if previous_tokens is None or current_tokens is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error":
+                    "previous/current tokens must be integer lists or rendered prompt strings"
+                })
+        dispatched = False
+        try:
+            dispatched = bool(
+                self.generator.invalidate_kv_stale_branch(
+                    previous_tokens, current_tokens))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"invalidate_kv_cache_stale_branch failed: {exc}")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        return JSONResponse(content={
+            "dispatched": dispatched,
+            "previous_len": len(previous_tokens),
+            "current_len": len(current_tokens),
         })
 
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):

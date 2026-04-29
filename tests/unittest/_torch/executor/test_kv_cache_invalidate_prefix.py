@@ -154,6 +154,36 @@ class TestKVCacheInvalidatePrefix(unittest.TestCase):
         mgr.free_resources(req2)
         mgr.shutdown()
 
+    def test_no_cache_on_finish_skips_context_store(self):
+        """NCOF must also block the context-store path.
+
+        PR #13029 can store context blocks before removeSequence() runs.  If
+        no_cache_on_finish only guards finish-time storeBlocksForReuse, a flagged
+        request would still populate the radix tree during storeContextBlocks().
+        """
+        mgr = _make_manager()
+        tokens = list(range(500, 628))  # two full blocks
+        baseline_reused = mgr.get_kv_cache_stats().reused_blocks
+
+        req1 = _make_request(req_id=0, input_tokens=tokens, no_cache_on_finish=True)
+        mgr.impl.add_sequence(req1.py_request_id, req1.prompt_len, 1, req1)
+        simulate_prefill_completion_only_use_for_testing(req1)
+        mgr.impl.store_context_blocks(req1)
+        mgr.free_resources(req1)
+
+        req2 = _make_request(req_id=1, input_tokens=tokens)
+        mgr.impl.add_sequence(req2.py_request_id, req2.prompt_len, 1, req2)
+        stats_after = mgr.get_kv_cache_stats()
+        self.assertEqual(
+            stats_after.reused_blocks,
+            baseline_reused,
+            msg="NCOF request leaked blocks through storeContextBlocks; "
+            f"reused climbed from {baseline_reused} to {stats_after.reused_blocks}",
+        )
+        simulate_prefill_completion_only_use_for_testing(req2)
+        mgr.free_resources(req2)
+        mgr.shutdown()
+
     # ------------------------------------------------------------------
     # invalidate_prefix: retrospective eviction
     # ------------------------------------------------------------------
@@ -248,6 +278,58 @@ class TestKVCacheInvalidatePrefix(unittest.TestCase):
 
         simulate_prefill_completion_only_use_for_testing(req2)
         mgr.free_resources(req2)
+        mgr.shutdown()
+
+    def test_invalidate_stale_branch_preserves_common_prefix(self):
+        """stale-branch invalidation should keep still-visible common blocks.
+
+        Previous prompt = common + old_branch.
+        Current prompt  = common + new_branch.
+
+        After invalidating the stale branch, probing the previous prompt should
+        reuse only the common block (old branch gone), while probing the current
+        prompt should still reuse the common block.
+        """
+        mgr = _make_manager()
+        common = list(range(1000, 1064))
+        old_branch = list(range(2000, 2064))
+        new_branch = list(range(3000, 3064))
+        previous = common + old_branch
+        current = common + new_branch
+
+        req1 = _make_request(req_id=0, input_tokens=previous)
+        mgr.impl.add_sequence(req1.py_request_id, req1.prompt_len, 1, req1)
+        simulate_prefill_completion_only_use_for_testing(req1)
+        mgr.free_resources(req1)
+
+        # Before invalidation, the full previous prompt should reuse both full blocks.
+        pre = mgr.get_kv_cache_stats().reused_blocks
+        old_probe_before = _make_request(req_id=1, input_tokens=previous)
+        mgr.impl.add_sequence(old_probe_before.py_request_id, old_probe_before.prompt_len, 1, old_probe_before)
+        reused_old_before = mgr.get_kv_cache_stats().reused_blocks - pre
+        self.assertGreaterEqual(reused_old_before, 2)
+        simulate_prefill_completion_only_use_for_testing(old_probe_before)
+        mgr.free_resources(old_probe_before)
+
+        mgr.invalidate_stale_branch(previous, current)
+
+        # The old branch should be gone: only the common block can be reused.
+        pre_old_after = mgr.get_kv_cache_stats().reused_blocks
+        old_probe_after = _make_request(req_id=2, input_tokens=previous)
+        mgr.impl.add_sequence(old_probe_after.py_request_id, old_probe_after.prompt_len, 1, old_probe_after)
+        reused_old_after = mgr.get_kv_cache_stats().reused_blocks - pre_old_after
+        self.assertLessEqual(reused_old_after, 1)
+        simulate_prefill_completion_only_use_for_testing(old_probe_after)
+        mgr.free_resources(old_probe_after)
+
+        # The current prompt still sees the common prefix.
+        pre_current = mgr.get_kv_cache_stats().reused_blocks
+        current_probe = _make_request(req_id=3, input_tokens=current)
+        mgr.impl.add_sequence(current_probe.py_request_id, current_probe.prompt_len, 1, current_probe)
+        reused_current = mgr.get_kv_cache_stats().reused_blocks - pre_current
+        self.assertGreaterEqual(reused_current, 1)
+        simulate_prefill_completion_only_use_for_testing(current_probe)
+        mgr.free_resources(current_probe)
         mgr.shutdown()
 
 

@@ -341,6 +341,25 @@ class BaseWorker(GenerationExecutor):
             f"invalidate_kv_prefix: dispatched {len(prefix_tokens)} tokens")
         return True
 
+    def invalidate_kv_stale_branch(self, previous_tokens, current_tokens) -> bool:
+        """Evict only the stale old branch beyond the previous/current common prefix."""
+        if isinstance(self.engine, tllm.Executor):
+            logger.debug("invalidate_kv_stale_branch: TRT Executor backend, no-op")
+            return False
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            ResourceManagerType
+        resource_mgr = getattr(self.engine, "resource_manager", None)
+        if resource_mgr is None:
+            return False
+        kv_mgr = resource_mgr.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_mgr is None or not hasattr(kv_mgr, "invalidate_stale_branch"):
+            return False
+        kv_mgr.invalidate_stale_branch(list(previous_tokens), list(current_tokens))
+        logger.debug("invalidate_kv_stale_branch: dispatched previous=%d current=%d tokens",
+                     len(previous_tokens), len(current_tokens))
+        return True
+
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None

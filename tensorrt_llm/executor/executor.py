@@ -126,6 +126,10 @@ class GenerationExecutor(ABC):
         """
         return False
 
+    def invalidate_kv_stale_branch(self, previous_tokens, current_tokens) -> bool:
+        """Evict only the stale branch beyond the previous/current common prefix."""
+        return False
+
     def generate_async(
         self,
         prompt_token_ids: List[int],

@@ -845,6 +845,15 @@ class KVCacheManager(BaseResourceManager):
         """
         return self.impl.invalidate_prefix(list(prefix_tokens))
 
+    def invalidate_stale_branch(self, previous_tokens, current_tokens):
+        """Evict the previous-only branch beyond the common full-block prefix.
+
+        This preserves KV blocks that are still visible in the current prompt
+        while removing stale descendants from the old pre-truncation prompt.
+        """
+        return self.impl.invalidate_stale_branch(list(previous_tokens),
+                                                list(current_tokens))
+
     @staticmethod
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,

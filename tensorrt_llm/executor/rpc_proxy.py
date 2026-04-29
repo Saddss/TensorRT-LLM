@@ -196,6 +196,18 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger.warning(f"[proxy] invalidate_kv_prefix RPC raised: {e!r}")
             return False
 
+    def invalidate_kv_stale_branch(self, previous_tokens, current_tokens) -> bool:
+        """Forward invalidate_kv_stale_branch to the RPC worker.  Issue #13080."""
+        try:
+            result = self.rpc_client.invalidate_kv_stale_branch(
+                previous_tokens=list(previous_tokens),
+                current_tokens=list(current_tokens)).remote()
+            return bool(result)
+        except Exception as e:
+            logger.warning(
+                f"[proxy] invalidate_kv_stale_branch RPC raised: {e!r}")
+            return False
+
     def shutdown(self):
         if self._shutdown_event.is_set():
             return
