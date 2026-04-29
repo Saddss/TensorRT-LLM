@@ -1392,6 +1392,7 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
     BlockPtr deepestIdleMatch = nullptr;
+    std::vector<BlockPtr> idleMatches;
     SizeType32 matchedDepth = 0;
 
     for (auto const& blockKey : blockKeys)
@@ -1416,18 +1417,33 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
             break;
         }
         deepestIdleMatch = matchingBlock;
+        idleMatches.push_back(matchingBlock);
         ++matchedDepth;
         searchRoot = std::move(matchingBlock);
     }
 
     if (deepestIdleMatch)
     {
-        TLLM_LOG_DEBUG("%s::invalidatePrefix - pruning block %d (depth=%d/%zu) and all descendants", mLogPrefix.c_str(),
-            deepestIdleMatch->getBlockId(), matchedDepth, blockKeys.size());
-        // Detach from the radix tree.  The block stays in the eviction policy's
-        // free queue (no refs), so it will be handed out to the next allocation
-        // but can no longer be found by a prefix lookup.
+        TLLM_LOG_DEBUG("%s::invalidatePrefix - pruning %zu idle matched blocks through block %d (depth=%d/%zu) "
+                       "and descendants",
+            mLogPrefix.c_str(), idleMatches.size(), deepestIdleMatch->getBlockId(), matchedDepth, blockKeys.size());
+        // Detach the matched idle chain, not only the leaf.  The original Issue
+        // #13080 implementation pruned the deepest matched block and its
+        // descendants, which left the upstream idle prefix blocks reachable in
+        // the radix tree.  For a client that has detected prompt truncation, the
+        // entire old idle chain is stale: future prompts should rebuild/cache the
+        // new visible prompt rather than keep matching blocks from the hidden
+        // pre-truncation path.  Descendants must be detached before ancestors so
+        // LookupNode cascade-pruning never removes a parent before its children
+        // have been visited.
         deepestIdleMatch->freeBlockAndAllDescendants();
+        for (auto it = idleMatches.rbegin(); it != idleMatches.rend(); ++it)
+        {
+            if (*it != deepestIdleMatch)
+            {
+                (*it)->detachFromLookupNode();
+            }
+        }
     }
     else
     {
@@ -3223,9 +3239,21 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     if (found)
     {
         auto& sequence = getSequence(requestId);
-        if (mEnableBlockReuse && !llmRequest.isDummyRequest())
+        // Issue #13080: no_cache_on_finish must also suppress the context-block
+        // insertion path.  After PR #13029, context blocks can enter the radix
+        // tree before removeSequence()/storeBlocksForReuse runs at request
+        // teardown.  Guarding only removeSequence is therefore insufficient:
+        // a request flagged as NCOF would still pollute the reuse tree during
+        // storeContextBlocks and later appear reusable to following turns.
+        if (mEnableBlockReuse && !llmRequest.isDummyRequest() && !llmRequest.getNoCacheOnFinish())
         {
             mBlockManager.storeContextBlocks(sequence, llmRequest);
+        }
+        else if (llmRequest.getNoCacheOnFinish())
+        {
+            TLLM_LOG_DEBUG("[kv cache manager] storeContextBlocks: no_cache_on_finish=true, "
+                           "skipping radix-tree insertion for request %lu",
+                requestId);
         }
     }
     else

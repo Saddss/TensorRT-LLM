@@ -793,12 +793,11 @@ public:
 
     //! \brief Retrospectively invalidate any cached blocks matching the given token prefix.
     //! \details Walks the radix tree starting from \c mCachedBlocksRoot, following the
-    //!          prefix token-block chain. Prunes the deepest matched block whose subtree
-    //!          is entirely idle (\c hasRefs() == false on the matched block) along with
-    //!          all of its descendants. Blocks currently in use by an active sequence are
-    //!          left untouched, as are partial (non-full-block) tails of the prefix.  This
-    //!          is the radix-tree primitive backing the `invalidatePrefix` REST endpoint
-    //!          added for Issue #13080.
+    //!          prefix token-block chain. Prunes the matched idle chain and all descendants
+    //!          reachable from the deepest match. Blocks currently in use by an active
+    //!          sequence are left untouched, as are partial (non-full-block) tails of the
+    //!          prefix. This is the radix-tree primitive backing the `invalidatePrefix`
+    //!          REST endpoint added for Issue #13080.
     //! \param prefixTokens Token IDs representing the prompt prefix to invalidate.
     //!                     Extra IDs default to 0 and LoRA task id is left unset.
     void invalidatePrefix(VecTokens const& prefixTokens);
