@@ -1539,6 +1539,12 @@ void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, 
                    "(previous_blocks=%zu, current_blocks=%zu)",
         mLogPrefix.c_str(), commonDepth, staleBranch->getBlockId(), previousBlocks.size(), currentBlocks.size());
     staleBranch->freeBlockAndAllDescendants();
+    // Be explicit about severing the previous-only edge from the preserved
+    // common-prefix node.  The block detach path clears value slots and
+    // cascade-prunes empty nodes, but this guarantees the stale branch key is
+    // no longer traversable even if placeholder/descendant structure kept the
+    // trie node alive.
+    searchRoot->removeNextBlock(previousKeys[commonDepth]);
 }
 
 SizeType32 WindowBlockManager::countReusableBlocks(
