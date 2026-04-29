@@ -18,7 +18,7 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
 import uvicorn
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -621,6 +621,12 @@ class OpenAIServer:
                                self.get_server_info,
                                methods=["GET"])
         if self.generator.args.return_perf_metrics:
+            self.app.add_api_route("/metrics/structured",
+                                   self.get_structured_metrics,
+                                   methods=["GET"])
+            self.app.add_api_route("/v1/metrics/structured",
+                                   self.get_structured_metrics,
+                                   methods=["GET"])
             # register /prometheus/metrics
             self.mount_metrics()
 
@@ -779,6 +785,29 @@ class OpenAIServer:
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_structured_metrics(
+        self,
+        windows: Annotated[Optional[str], Query(description="Comma-separated window sizes in seconds")] = None,
+        buckets: Annotated[Optional[str], Query(description="Comma-separated token bucket upper bounds")] = None,
+    ) -> JSONResponse:
+        if not self.metrics_collector:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "structured metrics require return_perf_metrics"})
+        from tensorrt_llm.metrics.structured import (DEFAULT_TOKEN_BUCKETS,
+                                                     DEFAULT_WINDOWS_SECONDS,
+                                                     parse_csv_numbers)
+
+        try:
+            window_values = parse_csv_numbers(windows, DEFAULT_WINDOWS_SECONDS)
+            bucket_values = [int(v) for v in parse_csv_numbers(
+                buckets, DEFAULT_TOKEN_BUCKETS)]
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return JSONResponse(
+            content=self.metrics_collector.structured_metrics.snapshot(
+                window_values, bucket_values))
 
     async def get_energy_metrics(self) -> JSONResponse:
         if self.energy_monitor is None:

@@ -18,6 +18,7 @@ import time
 from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
+from .structured import StructuredMetricsStore
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -125,6 +126,7 @@ class MetricsCollector:
         self.last_log_time = time.time()
         self.labels = labels
         self.metric_prefix = "trtllm_"
+        self.structured_metrics = StructuredMetricsStore()
 
         self.finish_reason_label = {
             MetricsCollector.labelname_finish_reason: "unknown"
@@ -533,12 +535,16 @@ class MetricsCollector:
                                                   0):
                 self._log_histogram(self.histogram_inference_time_request,
                                     inference_time)
-            if prompt_tokens := metrics_dict.get(MetricNames.PROMPT_TOKENS, 0):
+            prompt_tokens = metrics_dict.get(MetricNames.PROMPT_TOKENS, 0) or 0
+            generation_tokens = metrics_dict.get(MetricNames.GENERATION_TOKENS,
+                                                 0) or 0
+            if prompt_tokens:
                 self._log_counter(self.counter_prompt_tokens, {}, prompt_tokens)
-            if generation_tokens := metrics_dict.get(
-                    MetricNames.GENERATION_TOKENS, 0):
+            if generation_tokens:
                 self._log_counter(self.counter_generation_tokens, {},
                                   generation_tokens)
+            self.structured_metrics.record_request(prompt_tokens,
+                                                   generation_tokens)
             self.last_log_time = time.time()
 
     def log_iteration_stats(self, iteration_stats: dict) -> None:
@@ -679,6 +685,7 @@ class MetricsCollector:
 
         # Per-iteration KV cache stats (aggregated across window sizes)
         if kv_iter := iteration_stats.get("kvCacheIterationStats"):
+            self.structured_metrics.record_kv_iteration(kv_iter)
             # Aggregate across all window sizes
             total_secondary_max = 0
             total_secondary_used = 0
