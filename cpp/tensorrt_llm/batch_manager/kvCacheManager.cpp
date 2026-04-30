@@ -1111,6 +1111,105 @@ void WindowBlockManager::startScheduling()
     }
 }
 
+namespace
+{
+// BFS-collect every block reachable through the lookup-tree starting at
+// \p root, including \p root itself.  Used by invalidate{Prefix,StaleBranch}
+// to enumerate the pruned subtree before detaching it, so the caller can
+// fix up eviction-policy bookkeeping (priority/queue position) afterwards.
+//
+// Safe to call before \c freeBlockAndAllDescendants because:
+//   1. We only read children via \c KVCacheBlock::getNextBlocks().
+//   2. \c BlockPtr is shared_ptr — collected refs keep blocks alive even
+//      after \c detachFromLookupNode clears their lookup-tree links.
+std::vector<BlockPtr> collectSubtreeBlocks(BlockPtr const& root)
+{
+    std::vector<BlockPtr> result;
+    if (root == nullptr)
+    {
+        return result;
+    }
+    std::vector<BlockPtr> stack;
+    stack.push_back(root);
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        for (auto const& [key, child] : current->getNextBlocks())
+        {
+            stack.push_back(child);
+        }
+        result.push_back(std::move(current));
+    }
+    return result;
+}
+} // namespace
+
+void WindowBlockManager::reclaimAtPriorityZero(std::vector<BlockPtr> const& blocks)
+{
+    SizeType32 reclaimed = 0;
+    SizeType32 skippedActive = 0;
+    SizeType32 skippedScheduled = 0;
+    for (auto const& block : blocks)
+    {
+        if (block == nullptr)
+        {
+            continue;
+        }
+        if (block->hasRefs())
+        {
+            // Active sequence still owns this block.  Leave it alone — when refs
+            // drop to 0 it will go through the normal releaseBlock path.  We must
+            // not yank an in-flight block's priority out from under the eviction
+            // policy.
+            ++skippedActive;
+            continue;
+        }
+        if (block->hasSchedulingRefs())
+        {
+            // Phase-7 finding: PyExecutor's two-phase schedule increments
+            // mSchedulingRefCount on blocks it has tentatively chosen for an
+            // upcoming step before the real refCount is bumped during allocate.
+            // If we re-prioritize such a block to priority 0, the scheduler
+            // believes it still owns the block while a concurrent getFreeBlock
+            // can hand the same physical slot to a different sequence — at
+            // q6.5 this manifests as a sudden 0% success-rate cliff in late
+            // rounds (server stays alive, all HTTP 200 OK, but client-side
+            // streams hang past 120s timeout).  Treat scheduling refs the same
+            // as real refs: skip and let the normal release path place the
+            // block back in the queue once scheduling settles.
+            ++skippedScheduled;
+            continue;
+        }
+        // claimBlock(priority=0) erases any existing free-queue iterator (if the
+        // block was already idle) and rewrites priority to kMinRetentionPriority.
+        // priority 0 < secondaryOffloadMinPriority (30) flips canOffload to false,
+        // which is the whole point of the fix — dead blocks no longer waste PCIe
+        // bandwidth on D2H offload to host_cache.
+        // releaseBlock(toFront=false) re-inserts at the *tail* of
+        // mFreeQueues[level][0] rather than the head.  Phase-7 measurement
+        // showed that toFront=true produces a 0%-success-rate cliff at q6.5
+        // because the just-detached blocks become the very next victim of
+        // getFreeBlock and get reassigned faster than PyExecutor's scheduler
+        // can re-evaluate dependencies.  toFront=false still keeps these
+        // blocks ahead of every priority>=1 block (they sit in the priority-0
+        // queue while normal blocks are at priority 35), so they are still
+        // reclaimed before any useful cached block — but without racing the
+        // scheduler.  This preserves the +0.5 QPS gain at q5.5 without the
+        // q6.5 collapse.
+        mEvictionPolicy->claimBlock(
+            block, /*priority=*/executor::KvCacheRetentionConfig::kMinRetentionPriority, /*durationMs=*/std::nullopt);
+        mEvictionPolicy->releaseBlock(block, /*toFront=*/false);
+        ++reclaimed;
+    }
+    if (reclaimed > 0 || skippedActive > 0 || skippedScheduled > 0)
+    {
+        TLLM_LOG_INFO(
+            "%s::reclaimAtPriorityZero - reclaimed=%d skipped_active=%d skipped_scheduled=%d (input=%zu)",
+            mLogPrefix.c_str(), reclaimed, skippedActive, skippedScheduled, blocks.size());
+    }
+}
+
 void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 {
     // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
@@ -1435,6 +1534,19 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
         TLLM_LOG_DEBUG("%s::invalidatePrefix - pruning %zu idle matched blocks through block %d (depth=%d/%zu) "
                        "and descendants",
             mLogPrefix.c_str(), idleMatches.size(), deepestIdleMatch->getBlockId(), matchedDepth, blockKeys.size());
+        // Issue #13080 fix: collect every block in the doomed subtree *before*
+        // detaching, so we can re-prioritize them after the radix-tree mutation.
+        // Without this re-prioritization step the blocks stay at their original
+        // priority (35) in the free queue and are still offload-eligible — the
+        // root cause of the negative-ROI seen in phase-5 stale-branch ablation.
+        auto reclaimable = collectSubtreeBlocks(deepestIdleMatch);
+        for (auto const& ancestor : idleMatches)
+        {
+            if (ancestor != deepestIdleMatch)
+            {
+                reclaimable.push_back(ancestor);
+            }
+        }
         // Detach the matched idle chain, not only the leaf.  The original Issue
         // #13080 implementation pruned the deepest matched block and its
         // descendants, which left the upstream idle prefix blocks reachable in
@@ -1452,6 +1564,11 @@ void WindowBlockManager::invalidatePrefix(VecTokens const& prefixTokens)
                 (*it)->detachFromLookupNode();
             }
         }
+        // After detaching, re-queue every now-orphan block at priority 0 toFront.
+        // This is the fix for the phase-5 negative ROI: blocks are no longer
+        // offload-eligible (canOffload becomes false) and become the next victims
+        // of getFreeBlock, freeing GPU memory promptly without polluting host_cache.
+        reclaimAtPriorityZero(reclaimable);
     }
     else
     {
@@ -1545,6 +1662,15 @@ void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, 
     TLLM_LOG_DEBUG("%s::invalidateStaleBranch - preserving %zu common blocks, pruning stale block %d "
                    "(previous_blocks=%zu, current_blocks=%zu)",
         mLogPrefix.c_str(), commonDepth, staleBranch->getBlockId(), previousBlocks.size(), currentBlocks.size());
+    // Issue #13080 fix: collect the doomed subtree *before* detaching it from
+    // the radix tree.  collectSubtreeBlocks captures BlockPtr references so the
+    // blocks remain alive after detachFromLookupNode clears their lookup-tree
+    // links, allowing the subsequent reclaimAtPriorityZero call to re-queue
+    // them at priority 0 (toFront=true).  Without this fix the detached blocks
+    // stay at priority 35 in the free queue and remain offload-eligible —
+    // burning PCIe bandwidth on data that will never be reused.  This was the
+    // root cause of phase-5 stale-branch's +1.7s latency at q5.5 vs baseline.
+    auto reclaimable = collectSubtreeBlocks(staleBranch);
     staleBranch->freeBlockAndAllDescendants();
     // Be explicit about severing the previous-only edge from the preserved
     // common-prefix node.  The block detach path clears value slots and
@@ -1552,6 +1678,9 @@ void WindowBlockManager::invalidateStaleBranch(VecTokens const& previousTokens, 
     // no longer traversable even if placeholder/descendant structure kept the
     // trie node alive.
     searchRoot->removeNextBlock(previousKeys[commonDepth]);
+    // Re-queue every detached idle block at priority 0 toFront so the eviction
+    // policy reclaims them next and skips the wasteful D2H offload.
+    reclaimAtPriorityZero(reclaimable);
 }
 
 SizeType32 WindowBlockManager::countReusableBlocks(

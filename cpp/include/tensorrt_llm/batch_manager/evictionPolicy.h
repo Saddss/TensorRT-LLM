@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
 #include <chrono>
+#include <mutex>
 #include <vector>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
@@ -124,6 +125,18 @@ private:
     executor::RetentionPriority mSecondaryOffloadMinPriority;
     // Heap of block expiration times
     std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
+    // Issue #13080: serialize all public state mutations.  Originally PyExecutor
+    // owned this state single-threadedly (step loop is serial), but the Issue
+    // #13080 invalidate{Prefix,StaleBranch} REST endpoints route through an RPC
+    // ThreadPoolExecutor whose handlers release the GIL via
+    // nb::call_guard<nb::gil_scoped_release> — they hit claimBlock/releaseBlock
+    // concurrently with PyExecutor's getFreeBlock/storeBlocks path.  Without
+    // this mutex, the two threads race on mFreeQueues/mFreeBlockIterators,
+    // producing dangling list iterators and silent client timeouts at high
+    // QPS (phase-6 trunc20 q6.5 success_rate 0% in late rounds).  The lock is
+    // taken on every public API; inside contention is rare because the
+    // PyExecutor step loop dominates.
+    mutable std::mutex mMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

@@ -1123,6 +1123,26 @@ private:
     //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
     void freeLeafBlock(BlockPtr const& block);
 
+    //! \brief Re-queue every just-detached idle block at priority 0 (toFront=true).
+    //! \details Issue #13080 fix.  After invalidate{Prefix,StaleBranch} detaches a
+    //!          stale path from the radix tree, the underlying KV blocks remain in
+    //!          the eviction policy's free queue at their *original* priority
+    //!          (kDefaultRetentionPriority=35).  Without explicit re-queuing,
+    //!          \c LRUEvictionPolicy::getFreeBlock still finds them in the
+    //!          priority-35 queue and computes
+    //!          \c canOffload = priority >= secondaryOffloadMinPriority(30) = true,
+    //!          so they get D2H-offloaded to host_cache before being reclaimed —
+    //!          burning PCIe bandwidth on data that will never be onboarded back
+    //!          and starving useful cached blocks of host bandwidth.  This was the
+    //!          root cause of the negative ROI observed in the phase-5 stale-branch
+    //!          ablation (q5.5 +1.7s vs baseline).  Re-queuing at priority 0
+    //!          (toFront=true) (a) disables offload via
+    //!          \c canOffload = 0 >= 30 = false, and (b) makes these blocks the
+    //!          first ones reclaimed by the next \c getFreeBlock call.  Blocks
+    //!          still claimed by an active sequence are skipped — they will go
+    //!          through the normal release path when refs drop to 0.
+    void reclaimAtPriorityZero(std::vector<BlockPtr> const& blocks);
+
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
 
