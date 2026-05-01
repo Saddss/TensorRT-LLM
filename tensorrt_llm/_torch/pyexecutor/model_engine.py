@@ -2675,9 +2675,38 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
-        assert total_num_tokens <= self.max_num_tokens, (
-            f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
-        )
+        if total_num_tokens > self.max_num_tokens:
+            # Issue #13080: convert the previous bare ``assert`` into a scoped
+            # RuntimeError carrying the offending requests' bookkeeping.  The
+            # PyExecutor surrounding loop now scopes the failure to the
+            # affected requests instead of poisoning the whole process; the
+            # payload helps triage chunk size / draft token budget mismatches
+            # under sustained KV-cache pressure.
+            context_debug = [{
+                "request_id": getattr(req, "py_request_id", None),
+                "state": str(getattr(req, "state", None)),
+                "chunk_size": getattr(req, "context_chunk_size", None),
+                "current_position": getattr(req, "context_current_position", None),
+                "remaining_length": getattr(req, "context_remaining_length", None),
+                "estimated_reusable_tokens": getattr(req, "estimated_reusable_tokens", None),
+                "is_first_context_chunk": getattr(req, "is_first_context_chunk", None),
+                "is_last_context_chunk": getattr(req, "is_last_context_chunk", None),
+            } for req in scheduled_requests.context_requests]
+            generation_debug = [{
+                "request_id": getattr(req, "py_request_id", None),
+                "state": str(getattr(req, "state", None)),
+                "num_draft_tokens": getattr(req, "num_draft_tokens", None),
+                "seq_slot": getattr(req, "py_seq_slot", None),
+            } for req in scheduled_requests.generation_requests]
+            raise RuntimeError(
+                "max_num_tokens overflow before model forward: "
+                f"total_num_tokens={total_num_tokens}, "
+                f"max_num_tokens={self.max_num_tokens}, "
+                f"num_tokens={num_tokens}, num_draft_tokens={num_draft_tokens}, "
+                f"num_context_requests={len(scheduled_requests.context_requests)}, "
+                f"num_generation_requests={len(scheduled_requests.generation_requests)}, "
+                f"context_requests={context_debug[:8]}, "
+                f"generation_requests={generation_debug[:8]}")
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,

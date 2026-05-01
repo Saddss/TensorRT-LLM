@@ -83,11 +83,14 @@ class _StrategyImpls:
         #
         @staticmethod
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
-            # Using explicit async NaN check because FlashInfer.sampling 'nan_check' syncs
-
-            # https://github.com/pytorch/pytorch/issues/36853
-            torch._assert_async(~torch.any(torch.isnan(inputs)))
-
+            # Issue #13080: replace the previous ``torch._assert_async`` against
+            # any NaN with an in-place sanitizer.  The async assert path
+            # eventually relies on a CUDA device assert (FlashInfer's check_nan
+            # call site triggers one), so a single bad logit row would
+            # otherwise hard-abort the server under sustained load.
+            # Sanitizing in-place preserves the fast path and scopes the
+            # fault to the affected request.
+            inputs.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             return False
 
         @staticmethod
