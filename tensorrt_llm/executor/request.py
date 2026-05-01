@@ -106,6 +106,7 @@ class GenerationRequest:
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        no_cache_on_finish: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -138,6 +139,10 @@ class GenerationRequest:
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")
         self.priority = priority
+        # Issue #13080: per-request KV-cache hint that asks the manager to
+        # skip the reuse-store path when this request finishes.  Forwarded
+        # to the C++ LlmRequest in executor_request_to_llm_request.
+        self.no_cache_on_finish = no_cache_on_finish
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

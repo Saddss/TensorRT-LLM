@@ -172,6 +172,11 @@ void initBindings(nb::module_& m)
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
+        // Issue #13080: per-request hint that suppresses storeBlocksForReuse
+        // on finish.  Defaults to false; a multi-turn chat client that knows
+        // the just-finished turn is about to be sliding-window-truncated
+        // sets it true to keep the radix tree clean of soon-stale entries.
+        .def_prop_rw("no_cache_on_finish", &GenLlmReq::getNoCacheOnFinish, &GenLlmReq::setNoCacheOnFinish)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)

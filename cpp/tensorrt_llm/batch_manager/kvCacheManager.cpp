@@ -3179,7 +3179,13 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
     if (!sequenceNode.empty())
     {
-        if (mEnableBlockReuse)
+        // Issue #13080: a request may opt out of the reuse-store path for its
+        // own KV blocks via no_cache_on_finish.  The fast path (reuse off, or
+        // request opted-out) calls releaseBlocks with std::nullopt so the
+        // BlockManager skips storeBlocksForReuse and releases the chain
+        // straight back to the eviction policy.
+        bool const noCacheOnFinish = llmRequest.has_value() && llmRequest->getNoCacheOnFinish();
+        if (mEnableBlockReuse && !noCacheOnFinish)
         {
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), llmRequest, pinBlocks);
         }

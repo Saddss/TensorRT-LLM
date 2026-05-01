@@ -387,6 +387,30 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    # Issue #13080 TensorRT-LLM extension: per-request KV-cache hint that
+    # asks the manager to skip storeBlocksForReuse on finish.  Intended for
+    # multi-turn chat clients that already know a given turn is about to be
+    # sliding-window-truncated from future prompts.  Defaults to False.
+    trtllm_no_cache_on_finish: Optional[bool] = Field(
+        default=False,
+        description=("TensorRT-LLM extension.  If true, this request's KV "
+                     "blocks are NOT stored for reuse when the sequence "
+                     "finishes (Issue #13080, prospective prevention)."))
+
+    # Issue #13080 TensorRT-LLM extension: per-request decode-stage retention
+    # priority in [0, 100].  Values strictly less than the engine's
+    # secondary_offload_min_priority (30 by default) cause this request's KV
+    # blocks to skip the D2H offload and be reclaimed first by the LRU
+    # eviction policy.  Use 0 on the first sliding-window truncation of a
+    # conversation to keep the just-finished turn partial-reusable for one
+    # more round but PCIe-cheap to evict.
+    trtllm_kv_retention_priority: Optional[int] = Field(
+        default=None,
+        ge=0, le=100,
+        description=("TensorRT-LLM extension.  Per-request decode-stage KV "
+                     "retention priority in [0, 100].  Values < 30 disable "
+                     "D2H offload for this request's blocks (Issue #13080)."))
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -748,6 +772,30 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+
+    # Issue #13080 TensorRT-LLM extension: per-request KV-cache hint that
+    # asks the manager to skip storeBlocksForReuse on finish.  Intended for
+    # multi-turn chat clients that already know a given turn is about to be
+    # sliding-window-truncated from future prompts.  Defaults to False.
+    trtllm_no_cache_on_finish: Optional[bool] = Field(
+        default=False,
+        description=("TensorRT-LLM extension.  If true, this request's KV "
+                     "blocks are NOT stored for reuse when the sequence "
+                     "finishes (Issue #13080, prospective prevention)."))
+
+    # Issue #13080 TensorRT-LLM extension: per-request decode-stage retention
+    # priority in [0, 100].  Values strictly less than the engine's
+    # secondary_offload_min_priority (30 by default) cause this request's KV
+    # blocks to skip the D2H offload and be reclaimed first by the LRU
+    # eviction policy.  Use 0 on the first sliding-window truncation of a
+    # conversation to keep the just-finished turn partial-reusable for one
+    # more round but PCIe-cheap to evict.
+    trtllm_kv_retention_priority: Optional[int] = Field(
+        default=None,
+        ge=0, le=100,
+        description=("TensorRT-LLM extension.  Per-request decode-stage KV "
+                     "retention priority in [0, 100].  Values < 30 disable "
+                     "D2H offload for this request's blocks (Issue #13080)."))
 
     # doc: end-chat-completion-extra-params
 

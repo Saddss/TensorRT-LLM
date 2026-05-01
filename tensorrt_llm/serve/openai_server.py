@@ -30,6 +30,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
@@ -1127,6 +1128,17 @@ class OpenAIServer:
                     preprocess_fn, prompt, sampling_params,
                     disaggregated_params)
 
+            # Issue #13080: thread the optional decode-stage retention priority
+            # through to the executor as a KvCacheRetentionConfig.  None means
+            # "use the engine default (priority 35)" and is a no-op.
+            retention_priority = getattr(
+                request, "trtllm_kv_retention_priority", None)
+            kv_retention_config = (
+                KvCacheRetentionConfig(
+                    token_range_retention_configs=[],
+                    decode_retention_priority=retention_priority)
+                if retention_priority is not None else None)
+
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -1137,6 +1149,9 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                no_cache_on_finish=bool(
+                    getattr(request, "trtllm_no_cache_on_finish", False)),
+                kv_cache_retention_config=kv_retention_config,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1408,6 +1423,18 @@ class OpenAIServer:
                 else:
                     tokens_prompt = prompt
 
+                # Issue #13080: same KvCacheRetentionConfig path as the chat
+                # endpoint; lets clients dial down a request's KV blocks to
+                # priority 0 to skip the D2H offload and bias them to be the
+                # next victims of the LRU evictor.
+                retention_priority = getattr(
+                    request, "trtllm_kv_retention_priority", None)
+                kv_retention_config = (
+                    KvCacheRetentionConfig(
+                        token_range_retention_configs=[],
+                        decode_retention_priority=retention_priority)
+                    if retention_priority is not None else None)
+
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1415,7 +1442,10 @@ class OpenAIServer:
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
-                    trace_headers=trace_headers)
+                    trace_headers=trace_headers,
+                    no_cache_on_finish=bool(
+                        getattr(request, "trtllm_no_cache_on_finish", False)),
+                    kv_cache_retention_config=kv_retention_config)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:

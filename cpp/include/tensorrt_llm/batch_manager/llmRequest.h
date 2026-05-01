@@ -670,6 +670,19 @@ public:
         return mDraftTokens;
     }
 
+    /// @brief Issue #13080: per-request hint that asks the KV cache manager to
+    /// skip the reuse-store path on finish (sliding-window-truncated chats).
+    [[nodiscard]] bool getNoCacheOnFinish() const noexcept
+    {
+        return mNoCacheOnFinish;
+    }
+
+    /// @brief Issue #13080: setter for the no-cache-on-finish hint.
+    void setNoCacheOnFinish(bool value) noexcept
+    {
+        mNoCacheOnFinish = value;
+    }
+
     /// @brief Get the logits for the draft tokens
     /// @return Tensor of draft logits
     [[nodiscard]] std::optional<TensorPtr> getDraftLogits() const
@@ -2039,6 +2052,12 @@ protected:
     SizeType32 mContextChunkSizeDraft{0};
     SizeType32 mContextCurrentPositionTarget{0};
     SizeType32 mContextCurrentPositionDraft{0};
+
+    // Issue #13080: when true, KVCacheManager::removeSequence skips the
+    // storeBlocksForReuse path so the finished sequence's KV blocks go
+    // straight back to the eviction policy without polluting the radix
+    // tree.  Default false preserves existing behaviour.
+    bool mNoCacheOnFinish{false};
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]

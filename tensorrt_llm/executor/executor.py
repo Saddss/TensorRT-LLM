@@ -133,6 +133,7 @@ class GenerationExecutor(ABC):
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        no_cache_on_finish: bool = False,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -160,7 +161,8 @@ class GenerationExecutor(ABC):
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
-            priority=priority)
+            priority=priority,
+            no_cache_on_finish=no_cache_on_finish)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

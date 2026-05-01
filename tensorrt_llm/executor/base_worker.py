@@ -588,6 +588,13 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
+            # Issue #13080: forward the per-request no_cache_on_finish hint
+            # via a python-only attribute; executor_request_to_llm_request
+            # picks it up on the worker side.  Only meaningful for the pytorch
+            # backend (KVCacheManager); harmless on other backends.
+            if getattr(request, "no_cache_on_finish", False):
+                executor_request.py_no_cache_on_finish = True
+
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update

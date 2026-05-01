@@ -422,6 +422,7 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        no_cache_on_finish: bool = False,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -496,6 +497,7 @@ class BaseLLM:
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
             priority=priority,
+            no_cache_on_finish=no_cache_on_finish,
         )
 
         if sampling_params.return_perf_metrics:
