@@ -186,6 +186,22 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
 
+    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+        """Issue #13080: forward evict_conversation_prefix to the RPC worker.
+
+        Returns True if the worker reached a pytorch backend's KVCacheManager
+        and demoted at least one block.  Returns False on TRT-engine
+        backends or transport errors.
+        """
+        try:
+            result = self.rpc_client.evict_conversation_prefix(
+                prefix_tokens=list(prefix_tokens)).remote()
+            return bool(result)
+        except Exception as e:
+            logger.warning(
+                f"[rpc_proxy] evict_conversation_prefix RPC raised: {e!r}")
+            return False
+
     def shutdown(self):
         if self._shutdown_event.is_set():
             return

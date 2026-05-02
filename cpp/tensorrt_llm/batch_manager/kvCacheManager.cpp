@@ -3008,6 +3008,103 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
     }
 }
 
+void BlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
+{
+    // Issue #13080: a given conversation's KV may be cached at several window
+    // sizes (e.g. full attention + a sliding window).  Demote in all of them.
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        manager.evictConversationPrefix(prefixTokens);
+    }
+}
+
+void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
+{
+    // Issue #13080: walk the radix-reuse tree along the conversation prefix
+    // and, for every idle (refCount==0) match, demote it to retention
+    // priority 0 so the eviction policy picks it next AND does not waste a
+    // D2H offload (priority < secondary_offload_min_priority disables
+    // canOffload).  Lookup-tree attachment is intentionally preserved: a
+    // future prefix-match may still reuse the block before the evictor
+    // claims it; the evictor's getFreeBlock path will detach it on its own
+    // when the slot is finally repurposed.
+    if (prefixTokens.empty())
+    {
+        return;
+    }
+
+    auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(
+        prefixTokens, prefixTokens.size(), mTokensPerBlock, /*allowPartial=*/false);
+    if (blockedTokens.empty())
+    {
+        return;
+    }
+
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedTokens.size());
+    for (auto const& blockTokens : blockedTokens)
+    {
+        // No LoRA, no multimodal extras, no cache salt - this is the
+        // "plain text prefix" path.  Matches block keys that were stored
+        // with the same constraints (which is the common case for chat).
+        blockKeys.emplace_back(blockTokens);
+    }
+
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto searchRoot = mCachedBlocksRoot;
+    SizeType32 demoted = 0;
+    SizeType32 skippedActive = 0;
+    SizeType32 missed = 0;
+
+    for (auto const& blockKey : blockKeys)
+    {
+        if (searchRoot == nullptr)
+        {
+            break;
+        }
+        auto [partialMatch, numMatched, matchingBlock]
+            = searchRoot->findMatchingBlock(blockKey, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false);
+        if (matchingBlock == nullptr)
+        {
+            ++missed;
+            break;
+        }
+        if (matchingBlock->hasRefs())
+        {
+            // Some other live sequence is still using this block; we cannot
+            // touch its priority without racing the eviction policy.  Skip
+            // this layer but keep walking children: deeper turns may already
+            // be idle.
+            ++skippedActive;
+            searchRoot = std::move(matchingBlock);
+            continue;
+        }
+
+        // Idle, exclusive (no other sequence holds a ref).  Reclaim it from
+        // its current priority queue, set priority=0, and re-insert at the
+        // FRONT of the priority-0 queue so it is the very next victim of
+        // getFreeBlock.  priority < secondary_offload_min_priority(30) flips
+        // canOffload to false, so the evictor will skip the wasteful D2H
+        // offload.  We deliberately do NOT detachFromLookupNode here: a
+        // lucky future prefix-match may still reuse this block before the
+        // evictor claims it; if no one reuses it, the next getFreeBlock will
+        // detach it as part of its normal flow.
+        mEvictionPolicy->claimBlock(
+            matchingBlock, /*priority=*/executor::KvCacheRetentionConfig::kMinRetentionPriority,
+            /*durationMs=*/std::nullopt);
+        mEvictionPolicy->releaseBlock(matchingBlock, /*toFront=*/true);
+        ++demoted;
+        searchRoot = std::move(matchingBlock);
+    }
+
+    if (demoted > 0 || skippedActive > 0)
+    {
+        TLLM_LOG_INFO(
+            "%s::evictConversationPrefix - demoted=%d skipped_active=%d miss=%d (chain_depth=%zu, prefix_tokens=%zu)",
+            mLogPrefix.c_str(), demoted, skippedActive, missed, blockKeys.size(), prefixTokens.size());
+    }
+}
+
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
     SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
@@ -3685,6 +3782,19 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 {
     // Mimic Free all blocks for this sequence
     mBlockManager.schedulingReleaseBlocks(requestId);
+}
+
+void KVCacheManager::evictConversationPrefix(VecTokens const& prefixTokens)
+{
+    TLLM_LOG_TRACE("[%s]::%s start (prefix_len=%zu)", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__,
+        prefixTokens.size());
+    if (!mEnableBlockReuse)
+    {
+        TLLM_LOG_DEBUG("evictConversationPrefix: block reuse disabled, nothing to demote");
+        return;
+    }
+    mBlockManager.evictConversationPrefix(prefixTokens);
+    TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
 }
 
 void KVCacheManager::pinBlocks(RequestIdType requestId)
