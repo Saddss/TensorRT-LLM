@@ -948,6 +948,17 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
+    def evict_conversation_prefix(self, prefix_tokens):
+        """Issue #13080: retroactively demote idle radix-tree entries of a
+        conversation's KV prefix to retention priority 0.
+
+        See ``BaseKVCacheManager::evictConversationPrefix`` for the C++
+        semantics.  This is a thin forwarder.  ``prefix_tokens`` is an
+        iterable of integer token IDs representing the conversation's full
+        prior prompt (everything before the just-arrived truncation turn).
+        """
+        return self.impl.evict_conversation_prefix(list(prefix_tokens))
+
     @staticmethod
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,

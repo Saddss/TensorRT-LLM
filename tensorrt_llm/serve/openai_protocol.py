@@ -412,6 +412,24 @@ class CompletionRequest(OpenAIBaseModel):
             "its blocks are reclaimed first by the LRU evictor and skip "
             "D2H offload (priority < secondary_offload_min_priority=30)."))
 
+    # Issue #13080 TensorRT-LLM extension: retroactively demote idle
+    # radix-tree entries of a conversation's prior prompt to retention
+    # priority 0.  When set, the server tokenises this string with the
+    # model's chat template and walks the reuse tree along the resulting
+    # token sequence; every match whose hasRefs()==0 is moved to the head
+    # of the priority-0 free queue (next eviction victim AND no D2H
+    # offload).  Intended for the FIRST sliding-window truncation in a
+    # conversation: pass the conversation's full pre-truncation prompt
+    # string so the entire history KV becomes prefer-evict at once.
+    trtllm_kv_evict_prefix_text: Optional[str] = Field(
+        default=None,
+        description=("TensorRT-LLM extension.  When set, the server "
+                     "tokenises this rendered prompt string and demotes "
+                     "all matching idle blocks in the KV reuse tree to "
+                     "retention priority 0 (Issue #13080, retrospective "
+                     "demotion).  Use on the first truncation per "
+                     "conversation."))
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -783,6 +801,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "decode blocks.  Set 0 on a sliding-window-truncated turn so "
             "its blocks are reclaimed first by the LRU evictor and skip "
             "D2H offload (priority < secondary_offload_min_priority=30)."))
+
+    # Issue #13080: see CompletionRequest for full description.
+    trtllm_kv_evict_prefix_text: Optional[str] = Field(
+        default=None,
+        description=("TensorRT-LLM extension.  When set, the server "
+                     "tokenises this rendered prompt string and demotes "
+                     "all matching idle blocks in the KV reuse tree to "
+                     "retention priority 0 (Issue #13080, retrospective "
+                     "demotion).  Use on the first truncation per "
+                     "conversation."))
 
     # doc: end-chat-completion-extra-params
 
