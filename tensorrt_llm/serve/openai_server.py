@@ -1139,6 +1139,22 @@ class OpenAIServer:
                     decode_retention_priority=retention_priority)
                 if retention_priority is not None else None)
 
+            # Issue #13080 retrospective demotion: if the client supplied the
+            # conversation's full pre-truncation prompt, tokenize it and tell
+            # the KV cache manager to demote the matching idle entries to
+            # priority 0.  We do this BEFORE generate_async so the demotion
+            # is in effect when the new sequence's getFreeBlock fires.
+            evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
+            if evict_text and self.tokenizer is not None:
+                try:
+                    evict_tokens = self.tokenizer.tokenizer.encode(
+                        evict_text, add_special_tokens=False)
+                    await asyncio.to_thread(
+                        self.generator.evict_conversation_prefix, evict_tokens)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"evict_conversation_prefix failed (chat): {exc}")
+
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -1434,6 +1450,18 @@ class OpenAIServer:
                         token_range_retention_configs=[],
                         decode_retention_priority=retention_priority)
                     if retention_priority is not None else None)
+
+                # Issue #13080 retrospective demotion (same as chat endpoint).
+                evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
+                if evict_text and self.tokenizer is not None:
+                    try:
+                        evict_tokens = self.tokenizer.tokenizer.encode(
+                            evict_text, add_special_tokens=False)
+                        await asyncio.to_thread(
+                            self.generator.evict_conversation_prefix, evict_tokens)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"evict_conversation_prefix failed (completion): {exc}")
 
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,

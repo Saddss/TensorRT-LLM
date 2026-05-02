@@ -558,6 +558,16 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
+        // Issue #13080: retroactively demote idle blocks of a conversation
+        // prefix to retention priority 0.  Walks the radix-reuse tree along
+        // the supplied token sequence; for every match whose hasRefs()==0,
+        // moves the block to the head of the priority-0 free queue so the
+        // next getFreeBlock claims it AND skips D2H offload.  Held blocks
+        // (refCount>0) are skipped; the walk continues into their children.
+        .def("evict_conversation_prefix", &BaseKVCacheManager::evictConversationPrefix, nb::arg("prefix_tokens"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Demote idle blocks of a conversation's KV prefix to retention priority 0 "
+            "(Issue #13080).  No-op when block reuse is disabled or the prefix is empty.")
         .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
         .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),

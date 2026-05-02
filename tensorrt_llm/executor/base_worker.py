@@ -314,6 +314,27 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_kv_cache_events()
 
+    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+        """Issue #13080: forward to KVCacheManager.evict_conversation_prefix.
+
+        Returns True iff the call reached a pytorch backend's
+        KVCacheManager (the only backend that owns a reuse radix tree).
+        On TRT-engine executors this is a silent no-op.
+        """
+        if isinstance(self.engine, tllm.Executor):
+            return False
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            ResourceManagerType
+        resource_mgr = getattr(self.engine, "resource_manager", None)
+        if resource_mgr is None:
+            return False
+        kv_mgr = resource_mgr.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_mgr is None or not hasattr(kv_mgr, "evict_conversation_prefix"):
+            return False
+        kv_mgr.evict_conversation_prefix(list(prefix_tokens))
+        return True
+
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None

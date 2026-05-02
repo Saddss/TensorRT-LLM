@@ -116,6 +116,16 @@ class GenerationExecutor(ABC):
     def abort_request(self, request_id: int) -> None:
         pass
 
+    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+        """Issue #13080: retroactively demote idle radix-tree entries of a
+        conversation's KV prefix to retention priority 0.
+
+        Default no-op so OpenAI-server callers can use the hint
+        unconditionally; concrete subclasses (Proxy / RpcProxy / Worker)
+        override.
+        """
+        return False
+
     def generate_async(
         self,
         prompt_token_ids: List[int],

@@ -791,6 +791,23 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Issue #13080: retroactively demote idle blocks of a conversation
+    //!        prefix to retention priority 0.
+    //! \details Walks the radix-reuse tree along ``prefixTokens`` (chopped into
+    //!          full blocks) and, for each matching block whose ``hasRefs() == 0``
+    //!          (i.e. no active sequence is currently using it), reclaims it
+    //!          into the eviction policy's priority-0 queue at the front so it
+    //!          becomes the next victim of ``getFreeBlock`` and skips the D2H
+    //!          offload (priority < secondary_offload_min_priority).  The block
+    //!          is intentionally left attached to the lookup tree so prefix-match
+    //!          can still reuse it if the same prefix shows up again before
+    //!          eviction; the eventual ``getFreeBlock`` will detach it
+    //!          naturally.  Blocks held by an active sequence are skipped (a
+    //!          re-attach event is impossible at this granularity without race
+    //!          conditions) and the walk continues into their children.
+    //! \param prefixTokens Token IDs forming the conversation prefix to demote.
+    void evictConversationPrefix(VecTokens const& prefixTokens);
+
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1301,6 +1318,12 @@ public:
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
+
+    //! \brief Issue #13080: forward to every WindowBlockManager.
+    //! \details A given conversation prefix may be cached at several window
+    //!          sizes (full attention + sliding window).  We demote in all of
+    //!          them to keep the policy consistent.
+    void evictConversationPrefix(VecTokens const& prefixTokens);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1862,6 +1885,13 @@ public:
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false)
         = 0;
 
+    //! \brief Issue #13080: retroactively demote idle blocks of a conversation
+    //!        prefix to retention priority 0.
+    //! \details Default implementation does nothing - subclasses that own a
+    //! reuse radix tree (e.g. KVCacheManager) override this.  See
+    //! WindowBlockManager::evictConversationPrefix for the full semantics.
+    virtual void evictConversationPrefix(VecTokens const& /*prefixTokens*/) {}
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -2257,6 +2287,11 @@ public:
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false) override;
+
+    //! \brief Issue #13080: retroactively demote idle blocks of a conversation
+    //! prefix to retention priority 0.  Forwards to BlockManager which fans out
+    //! to every WindowBlockManager.
+    void evictConversationPrefix(VecTokens const& prefixTokens) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
