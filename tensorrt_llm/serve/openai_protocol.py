@@ -394,6 +394,24 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    # Issue #13080: per-request KV-cache retention priority hint.
+    # When set (typically 0 on a sliding-window-truncated turn), the server
+    # tags BOTH the prompt (context-phase) AND decode-phase blocks of this
+    # request with the supplied retention priority.  Values strictly less
+    # than ``secondary_offload_min_priority`` (default 30) make these blocks
+    # the next eviction victims AND skip the wasteful D2H offload, freeing
+    # primary KV cache slots for non-truncated conversations whose prefix
+    # reuse is still valuable.  Default ``None`` means "use engine default
+    # (35)" and is a no-op.
+    trtllm_kv_retention_priority: Optional[int] = Field(
+        default=None, ge=0, le=100,
+        description=(
+            "TensorRT-LLM extension (Issue #13080).  Per-request KV "
+            "retention priority in [0, 100] applied to both prompt and "
+            "decode blocks.  Set 0 on a sliding-window-truncated turn so "
+            "its blocks are reclaimed first by the LRU evictor and skip "
+            "D2H offload (priority < secondary_offload_min_priority=30)."))
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -755,6 +773,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+
+    # Issue #13080: see CompletionRequest for full description.
+    trtllm_kv_retention_priority: Optional[int] = Field(
+        default=None, ge=0, le=100,
+        description=(
+            "TensorRT-LLM extension (Issue #13080).  Per-request KV "
+            "retention priority in [0, 100] applied to both prompt and "
+            "decode blocks.  Set 0 on a sliding-window-truncated turn so "
+            "its blocks are reclaimed first by the LRU evictor and skip "
+            "D2H offload (priority < secondary_offload_min_priority=30)."))
 
     # doc: end-chat-completion-extra-params
 

@@ -30,6 +30,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
@@ -96,6 +97,38 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _build_kv_retention_config(retention_priority):
+    """Issue #13080: build a ``KvCacheRetentionConfig`` that applies the
+    supplied priority to BOTH the prompt (context phase) AND decode blocks.
+
+    The token-range list MUST cover the whole prompt: leaving it empty makes
+    ``getPerBlockRetentionPriorityDuration()`` return ``nullopt`` for every
+    context block and the kv-cache manager falls back to the engine default
+    (35) via ``.value_or(kDefaultRetentionPriority)`` — so the hint would
+    only affect the few decode-phase blocks (~4% of the request KV) and
+    have no measurable effect on prefix reuse pressure.
+
+    Args:
+        retention_priority: integer in [0, 100] or None.  None means "use
+        engine default" (no override is sent at all).
+
+    Returns:
+        KvCacheRetentionConfig or None.
+    """
+    if retention_priority is None:
+        return None
+    return KvCacheRetentionConfig(
+        token_range_retention_configs=[
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                token_start=0,
+                token_end=None,
+                priority=int(retention_priority),
+            )
+        ],
+        decode_retention_priority=int(retention_priority),
+    )
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1150,6 +1183,9 @@ class OpenAIServer:
                     preprocess_fn, prompt, sampling_params,
                     disaggregated_params)
 
+            kv_retention_config = _build_kv_retention_config(
+                getattr(request, "trtllm_kv_retention_priority", None))
+
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -1160,6 +1196,7 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                kv_cache_retention_config=kv_retention_config,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1435,6 +1472,9 @@ class OpenAIServer:
                 else:
                     tokens_prompt = prompt
 
+                kv_retention_config = _build_kv_retention_config(
+                    getattr(request, "trtllm_kv_retention_priority", None))
+
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1442,7 +1482,8 @@ class OpenAIServer:
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
-                    trace_headers=trace_headers)
+                    trace_headers=trace_headers,
+                    kv_cache_retention_config=kv_retention_config)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
