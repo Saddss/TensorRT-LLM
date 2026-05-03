@@ -2678,9 +2678,18 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
-        assert total_num_tokens <= self.max_num_tokens, (
-            f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
-        )
+        if total_num_tokens > self.max_num_tokens:
+            # Issue #13080: replace bare assert with a scoped RuntimeError carrying
+            # scheduling bookkeeping so the operator can attribute the overflow
+            # to a particular batch composition (ctx vs gen vs draft).
+            raise RuntimeError(
+                f"max_num_tokens overflow before model forward: "
+                f"total_num_tokens={total_num_tokens}, "
+                f"input_ids={num_tokens}, "
+                f"draft_tokens={num_draft_tokens}, "
+                f"max_num_tokens={self.max_num_tokens}, "
+                f"num_ctx_requests={len(scheduled_requests.context_requests)}, "
+                f"num_gen_requests={len(scheduled_requests.generation_requests)}")
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -3169,8 +3178,14 @@ class PyTorchModelEngine(ModelEngine):
             request.py_batch_idx = request.py_seq_slot
 
         num_tokens = len(input_ids)
-        assert num_tokens <= self.max_num_tokens, (
-            "num_tokens should be less than or equal to max_num_tokens")
+        if num_tokens > self.max_num_tokens:
+            # Issue #13080: scoped overflow error in _prepare_tp_inputs_no_cache.
+            raise RuntimeError(
+                f"max_num_tokens overflow before model forward "
+                f"(no-cache path): num_tokens={num_tokens}, "
+                f"max_num_tokens={self.max_num_tokens}, "
+                f"num_ctx_requests={len(scheduled_requests.context_requests)}, "
+                f"num_gen_requests={len(scheduled_requests.generation_requests)}")
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
@@ -3454,8 +3469,14 @@ class PyTorchModelEngine(ModelEngine):
             request.cached_tokens = num_cached_tokens_per_seq[-1]
 
         num_tokens = len(input_ids)
-        assert num_tokens <= self.max_num_tokens, (
-            "num_tokens should be less than or equal to max_num_tokens")
+        if num_tokens > self.max_num_tokens:
+            # Issue #13080: scoped overflow error in _prepare_star_attention_inputs.
+            raise RuntimeError(
+                f"max_num_tokens overflow before model forward "
+                f"(star-attention path): num_tokens={num_tokens}, "
+                f"max_num_tokens={self.max_num_tokens}, "
+                f"num_ctx_requests={len(scheduled_requests.context_requests)}, "
+                f"num_gen_requests={len(scheduled_requests.generation_requests)}")
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
@@ -3738,9 +3759,14 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = token_ids.shape[0]
         batch_size = seq_lens.shape[0]
 
-        assert num_tokens <= self.max_num_tokens, (
-            f"num_tokens ({num_tokens}) exceeds max_num_tokens "
-            f"({self.max_num_tokens}). Reduce batch size or sequence lengths.")
+        if num_tokens > self.max_num_tokens:
+            # Issue #13080: scoped overflow error in _prepare_encoder_inputs.
+            raise RuntimeError(
+                f"max_num_tokens overflow before encoder forward: "
+                f"num_tokens={num_tokens}, "
+                f"max_num_tokens={self.max_num_tokens}, "
+                f"batch_size={batch_size}. "
+                f"Reduce batch size or sequence lengths.")
 
         # 1. Copy to pre-allocated CUDA buffers
         self.input_ids_cuda[:num_tokens].copy_(token_ids, non_blocking=True)

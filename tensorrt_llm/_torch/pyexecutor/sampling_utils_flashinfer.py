@@ -76,18 +76,18 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
-        # TODO: Revisit this after determining performance impact
-        #
-        # NB: NaN logits can lead to crashes, see
+        # NB: NaN logits/probs can lead to crashes, see
         #     https://github.com/flashinfer-ai/flashinfer/issues/1575
         #
         @staticmethod
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
-            # Using explicit async NaN check because FlashInfer.sampling 'nan_check' syncs
-
-            # https://github.com/pytorch/pytorch/issues/36853
-            torch._assert_async(~torch.any(torch.isnan(inputs)))
-
+            # Issue #13080: torch._assert_async on NaN poisons the entire CUDA
+            # device (https://github.com/pytorch/pytorch/issues/36853) which
+            # kills the server.  In-place sanitize NaN/inf to finite values so
+            # the sampler proceeds with a deterministic fallback instead of
+            # crashing.  Returning False keeps FlashInfer's own sync nan_check
+            # disabled (it would otherwise force a host-device sync).
+            inputs.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             return False
 
         @staticmethod
