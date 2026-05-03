@@ -3097,12 +3097,13 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
         searchRoot = std::move(matchingBlock);
     }
 
-    if (demoted > 0 || skippedActive > 0)
-    {
-        TLLM_LOG_INFO(
-            "%s::evictConversationPrefix - demoted=%d skipped_active=%d miss=%d (chain_depth=%zu, prefix_tokens=%zu)",
-            mLogPrefix.c_str(), demoted, skippedActive, missed, blockKeys.size(), prefixTokens.size());
-    }
+    // Always log so the operator can tell "API was called but tree had
+    // no matching entry" (demoted=0 skipped_active=0 missed=N) apart
+    // from "API never reached".  Issue #13080 micro_validate_evict.py
+    // relies on this line as ground truth.
+    TLLM_LOG_INFO(
+        "%s::evictConversationPrefix - demoted=%d skipped_active=%d miss=%d (chain_depth=%zu, prefix_tokens=%zu)",
+        mLogPrefix.c_str(), demoted, skippedActive, missed, blockKeys.size(), prefixTokens.size());
 }
 
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
