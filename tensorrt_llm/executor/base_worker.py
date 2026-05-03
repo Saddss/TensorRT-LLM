@@ -321,18 +321,32 @@ class BaseWorker(GenerationExecutor):
         KVCacheManager (the only backend that owns a reuse radix tree).
         On TRT-engine executors this is a silent no-op.
         """
+        from tensorrt_llm.logger import logger
+        n_tokens = len(prefix_tokens) if prefix_tokens is not None else 0
+        logger.info(f"[evict] BaseWorker.evict_conversation_prefix called "
+                    f"with {n_tokens} tokens, engine type={type(self.engine).__name__}")
         if isinstance(self.engine, tllm.Executor):
+            logger.info(f"[evict] engine is tllm.Executor (TRT backend); no-op")
             return False
         from tensorrt_llm._torch.pyexecutor.resource_manager import \
             ResourceManagerType
         resource_mgr = getattr(self.engine, "resource_manager", None)
         if resource_mgr is None:
+            logger.warning(f"[evict] engine.resource_manager is None; cannot demote")
             return False
         kv_mgr = resource_mgr.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_mgr is None or not hasattr(kv_mgr, "evict_conversation_prefix"):
+        if kv_mgr is None:
+            logger.warning(f"[evict] resource_manager has no KV_CACHE_MANAGER; "
+                           f"available={list(resource_mgr.resource_managers.keys())}")
             return False
+        if not hasattr(kv_mgr, "evict_conversation_prefix"):
+            logger.warning(f"[evict] kv_mgr ({type(kv_mgr).__name__}) lacks "
+                           f"evict_conversation_prefix method")
+            return False
+        logger.info(f"[evict] forwarding {n_tokens} tokens to {type(kv_mgr).__name__}")
         kv_mgr.evict_conversation_prefix(list(prefix_tokens))
+        logger.info(f"[evict] kv_mgr.evict_conversation_prefix returned (n={n_tokens})")
         return True
 
     def set_result_queue(self, queue):

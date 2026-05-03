@@ -812,6 +812,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "demotion).  Use on the first truncation per "
                      "conversation."))
 
+    # Issue #13080: PREFERRED retrospective-demote field for chat clients.
+    # Pass the FULL conversation history that was sent on the *previous*
+    # turn, i.e. ``current_messages[:-1]`` (strip the new user message).
+    # Server applies the same ``apply_chat_template`` + tokenize pipeline
+    # that originally stored those blocks in the radix tree, so the
+    # resulting tokens match the stored BlockKeys exactly.  Use this
+    # instead of ``trtllm_kv_evict_prefix_text`` for chat completion -
+    # the text variant fails to match because it skips the chat
+    # template's special tokens (<|im_start|>, <|im_end|>, role tags).
+    trtllm_kv_evict_prefix_messages: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=("TensorRT-LLM extension.  When set, the server "
+                     "applies its chat template to these messages "
+                     "(add_generation_prompt=False), tokenises the "
+                     "result, and demotes every matching idle block in "
+                     "the KV reuse tree to retention priority 0.  This "
+                     "is the chat-correct analogue of "
+                     "trtllm_kv_evict_prefix_text (Issue #13080).  Set "
+                     "to current_messages[:-1] on the first truncation "
+                     "per conversation."))
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
