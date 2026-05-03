@@ -193,9 +193,14 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         and demoted at least one block.  Returns False on TRT-engine
         backends or transport errors.
         """
+        n = len(prefix_tokens) if prefix_tokens is not None else 0
+        logger.info(f"[rpc_proxy] evict_conversation_prefix dispatching "
+                    f"{n} tokens via rpc_client")
         try:
             result = self.rpc_client.evict_conversation_prefix(
                 prefix_tokens=list(prefix_tokens)).remote()
+            logger.info(f"[rpc_proxy] evict_conversation_prefix RPC returned "
+                        f"{result!r} (type={type(result).__name__})")
             return bool(result)
         except Exception as e:
             logger.warning(

@@ -1139,21 +1139,65 @@ class OpenAIServer:
                     decode_retention_priority=retention_priority)
                 if retention_priority is not None else None)
 
-            # Issue #13080 retrospective demotion: if the client supplied the
-            # conversation's full pre-truncation prompt, tokenize it and tell
-            # the KV cache manager to demote the matching idle entries to
-            # priority 0.  We do this BEFORE generate_async so the demotion
-            # is in effect when the new sequence's getFreeBlock fires.
+            # Issue #13080 retrospective demotion (CHAT-CORRECT path).
+            # If the client supplied the conversation's prior-turn message
+            # list, apply EXACTLY the same chat-template + tokenize pipeline
+            # that originally stored those blocks in the KV radix tree, then
+            # demote the matching idle entries to retention priority 0
+            # BEFORE generate_async so the demotion is in effect when the new
+            # sequence's getFreeBlock fires.  The text-only fallback
+            # (trtllm_kv_evict_prefix_text) is kept for completion clients;
+            # for chat it cannot match because it skips the template's
+            # special role tokens.
+            evict_msgs = getattr(request, "trtllm_kv_evict_prefix_messages", None)
             evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
-            if evict_text and self.tokenizer is not None:
+            if evict_msgs and self.tokenizer is not None:
+                try:
+                    evict_conv = [
+                        ConversationMessage(role=m.get("role"),
+                                            content=m.get("content", ""))
+                        for m in evict_msgs
+                    ]
+                    rendered: str = apply_chat_template(
+                        model_type=self.model_config.model_type,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=evict_conv,
+                        add_generation_prompt=False,
+                        mm_placeholder_counts=[{} for _ in evict_conv],
+                        chat_template=request.chat_template or self.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs or {},
+                    )
+                    evict_tokens = self.tokenizer.tokenizer.encode(
+                        rendered, add_special_tokens=False)
+                    logger.info(
+                        f"[evict-server] chat: rendered prior-turn "
+                        f"({len(evict_msgs)} msgs) -> {len(rendered)} chars "
+                        f"-> {len(evict_tokens)} tokens; calling "
+                        f"generator.evict_conversation_prefix")
+                    rc = await asyncio.to_thread(
+                        self.generator.evict_conversation_prefix, evict_tokens)
+                    logger.info(
+                        f"[evict-server] chat: evict_conversation_prefix "
+                        f"returned {rc!r} (n_tokens={len(evict_tokens)})")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"evict_conversation_prefix(messages) failed (chat): {exc}")
+            elif evict_text and self.tokenizer is not None:
+                # Plain-text fallback (deprecated for chat - kept for
+                # completeness only; will rarely match BlockKeys).
                 try:
                     evict_tokens = self.tokenizer.tokenizer.encode(
                         evict_text, add_special_tokens=False)
+                    logger.info(
+                        f"[evict-server] chat (text fallback): tokenized "
+                        f"{len(evict_tokens)} tokens; expect 0-match "
+                        f"because chat-template special tokens are absent")
                     await asyncio.to_thread(
                         self.generator.evict_conversation_prefix, evict_tokens)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        f"evict_conversation_prefix failed (chat): {exc}")
+                        f"evict_conversation_prefix(text) failed (chat): {exc}")
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
