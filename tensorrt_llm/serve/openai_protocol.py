@@ -833,6 +833,41 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "to current_messages[:-1] on the first truncation "
                      "per conversation."))
 
+    # Issue #13080 v9n optimization: client supplies the prior-turn token
+    # IDs directly.  Bypasses the server-side render+tokenize step which
+    # is the largest fraction of evict-call overhead (22.6 ms / 34.7 ms
+    # total at q=6.9 in the workload_g1_t100 measurement).  Use this
+    # field instead of ``trtllm_kv_evict_prefix_messages`` whenever the
+    # client already has tokenization (e.g. a chat backend that caches
+    # turn-by-turn tokens).  ``trtllm_kv_evict_skip_blocks`` is the
+    # number of leading blocks the server should walk-but-not-demote
+    # (typically the conversation's system prompt, ceiling-divided by
+    # the KV block size, plus a small safety buffer for chat-template
+    # wrapping -- mirror ``_compute_system_skip_blocks`` if computed
+    # client-side).  When BOTH ``token_ids`` and ``skip_blocks`` are
+    # supplied, the server takes the fast path and skips render+tokenize
+    # entirely.
+    trtllm_kv_evict_prefix_token_ids: Optional[List[int]] = Field(
+        default=None,
+        description=("TensorRT-LLM extension (Issue #13080).  Direct "
+                     "token-id list for the conversation's prior turn, "
+                     "used to demote matching idle radix-tree entries "
+                     "to retention priority 0.  Skips the server-side "
+                     "render+tokenize step.  Pair with "
+                     "``trtllm_kv_evict_skip_blocks`` to also skip the "
+                     "system-prompt computation."))
+    trtllm_kv_evict_skip_blocks: Optional[int] = Field(
+        default=None,
+        description=("TensorRT-LLM extension (Issue #13080).  Number of "
+                     "leading KV blocks to walk-but-not-demote when "
+                     "processing ``trtllm_kv_evict_prefix_token_ids`` / "
+                     "``trtllm_kv_evict_prefix_messages``.  Use this to "
+                     "protect a shared system-prompt prefix.  When "
+                     "omitted on the messages path, the server "
+                     "computes a safe value via ceiling-divide of the "
+                     "system-text token count plus a 2-block safety "
+                     "buffer for chat-template wrapping."))
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,

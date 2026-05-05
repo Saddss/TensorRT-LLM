@@ -1513,6 +1513,29 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     return result;
 }
 
+// Issue #13080 v9p fix: when a request reuses a previously demoted block
+// (priority < kDefaultRetentionPriority) without supplying an explicit
+// retention, restore priority to the default.  The original
+// claimBlock(nullopt) path was a no-op which let demoted blocks live one
+// extra hop and immediately die again -- punishing future continuation
+// hits.  This helper preserves "explicit user retention" and
+// "above-default retention" intact, only rescues low-priority blocks.
+static inline std::optional<executor::RetentionPriority> resolveClaimPriority(
+    std::optional<executor::RetentionPriority> userRetentionPriority,
+    executor::RetentionPriority currentBlockPriority)
+{
+    if (userRetentionPriority.has_value())
+    {
+        return userRetentionPriority;
+    }
+    if (currentBlockPriority < executor::KvCacheRetentionConfig::kDefaultRetentionPriority)
+    {
+        return std::optional<executor::RetentionPriority>(
+            executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+    }
+    return std::nullopt;
+}
+
 WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
     SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx,
     PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
@@ -1627,7 +1650,9 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                 {
                     // Unreferenced non-leaf: claim to protect from eviction during copies.
                     // Use tracker to assign release responsibility to the last copier.
-                    mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                    mEvictionPolicy->claimBlock(matchingBlock,
+                        resolveClaimPriority(result.perBlockRetentions[bi].retentionPriority,
+                            matchingBlock->getPriority()),
                         result.perBlockRetentions[bi].durationMs);
 
                     auto const blockId = matchingBlock->getBlockId();
@@ -1689,14 +1714,18 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                     claimed.needsCopy = false;
                     tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
                 }
-                mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                mEvictionPolicy->claimBlock(matchingBlock,
+                    resolveClaimPriority(result.perBlockRetentions[bi].retentionPriority,
+                        matchingBlock->getPriority()),
                     result.perBlockRetentions[bi].durationMs);
             }
         }
         else
         {
             // Full match — claim block (removes from free queue, protecting from eviction)
-            mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+            mEvictionPolicy->claimBlock(matchingBlock,
+                resolveClaimPriority(result.perBlockRetentions[bi].retentionPriority,
+                    matchingBlock->getPriority()),
                 result.perBlockRetentions[bi].durationMs);
 
             // If a previous request was going to reuse or release this block via partial match,
