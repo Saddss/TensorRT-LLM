@@ -186,8 +186,11 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
 
-    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+    def evict_conversation_prefix(self, prefix_tokens, skip_blocks: int = 0) -> bool:
         """Issue #13080: forward evict_conversation_prefix to the RPC worker.
+
+        ``skip_blocks`` (default 0) protects a leading shared system-prompt
+        prefix from being demoted.
 
         Returns True if the worker reached a pytorch backend's KVCacheManager
         and demoted at least one block.  Returns False on TRT-engine
@@ -195,10 +198,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         """
         n = len(prefix_tokens) if prefix_tokens is not None else 0
         logger.info(f"[rpc_proxy] evict_conversation_prefix dispatching "
-                    f"{n} tokens via rpc_client")
+                    f"{n} tokens (skip_blocks={skip_blocks}) via rpc_client")
         try:
             result = self.rpc_client.evict_conversation_prefix(
-                prefix_tokens=list(prefix_tokens)).remote()
+                prefix_tokens=list(prefix_tokens), skip_blocks=int(skip_blocks)).remote()
             logger.info(f"[rpc_proxy] evict_conversation_prefix RPC returned "
                         f"{result!r} (type={type(result).__name__})")
             return bool(result)

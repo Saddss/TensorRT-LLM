@@ -98,6 +98,83 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+# Issue #13080: KV cache page size used by trtllm by default.  Used to
+# convert a system-prompt token count into a block count for the
+# ``skip_blocks`` parameter of ``evict_conversation_prefix``.
+_KV_BLOCK_SIZE_TOKENS = 32
+
+
+def _compute_system_skip_tokens(messages, tokenizer) -> int:
+    """Issue #13080: estimate how many leading tokens of a rendered
+    chat prompt are part of the SYSTEM prompt (i.e. shared across
+    conversations).  We use the simplest definition: walk ``messages``
+    from the start and gather all consecutive role==system entries.
+    Tokenize that with ``add_special_tokens=False`` (the chat-template
+    path renders system messages without the BOS).  The exact count
+    doesn't have to be precise -- we want it to be a CONSERVATIVE
+    LOWER BOUND on the system block count so we never accidentally
+    demote a system block.
+
+    Note: the returned count is the BARE system text token count.
+    The CALLER must (a) round UP when converting to blocks (ceiling
+    division) and (b) add a small safety buffer to account for the
+    chat-template's special tokens (BOS, role markers, separators)
+    that wrap the system text in the rendered prompt.  Failing to do
+    so leaves the LAST system-tail block exposed to demotion -- and
+    because every conversation shares the same chat-template tail
+    around the system message, demoting it breaks ALL conversations'
+    prefix matches."""
+    if tokenizer is None or not messages:
+        return 0
+    sys_blob_parts = []
+    for m in messages:
+        role = (m.get("role") or "").lower() if isinstance(m, dict) else ""
+        if role != "system":
+            break
+        content = m.get("content", "")
+        if isinstance(content, str):
+            sys_blob_parts.append(content)
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    sys_blob_parts.append(c.get("text", ""))
+    if not sys_blob_parts:
+        return 0
+    blob = "\n".join(sys_blob_parts)
+    try:
+        toks = tokenizer.tokenizer.encode(blob, add_special_tokens=False)
+    except Exception:
+        return 0
+    return len(toks)
+
+
+def _compute_system_skip_blocks(sys_text_tokens: int, kv_block_size: int = _KV_BLOCK_SIZE_TOKENS) -> int:
+    """Issue #13080 iter2 fix: convert a bare-system-text token count to a
+    SAFE block count for ``evict_conversation_prefix(skip_blocks=...)``.
+
+    Three corrections vs. naive floor division:
+      1. CEILING division so the last partial system block is fully covered.
+      2. +1 buffer for chat-template wrapping (BOS, ``<|im_start|>system``,
+         ``<|im_end|>``, role-separator newlines, etc.) that the
+         bare-text tokenization misses.
+      3. +1 extra buffer because the rendered prompt may add the
+         ``<|im_start|>user`` opener immediately after the system
+         block ends -- if the boundary lands inside a 32-token block,
+         that block is STILL all-deterministic-template + first ~24
+         tokens of the user message, which we'd rather over-protect
+         than under-protect.
+
+    Total over-estimation: at most 2 blocks (~64 tokens).  This is a
+    cheap insurance against breaking unrelated conversations that
+    happen to share the system prompt + first user role marker.
+    """
+    if sys_text_tokens <= 0:
+        return 0
+    # Ceiling division.
+    base_blocks = (sys_text_tokens + kv_block_size - 1) // kv_block_size
+    # +2 safety buffer (template wrapping + boundary).
+    return base_blocks + 2
+
 
 def _build_kv_retention_config(retention_priority):
     """Issue #13080: build a ``KvCacheRetentionConfig`` that applies the
@@ -1217,16 +1294,27 @@ class OpenAIServer:
                     )
                     evict_tokens = self.tokenizer.tokenizer.encode(
                         rendered, add_special_tokens=False)
+                    # Issue #13080: protect the leading system-prompt
+                    # blocks from demotion.  Without this guard, the
+                    # walker also demotes shared system blocks during
+                    # brief idle windows -> future cross-conv hits drop.
+                    sys_skip_tokens = _compute_system_skip_tokens(
+                        evict_msgs, self.tokenizer)
+                    sys_skip_blocks = _compute_system_skip_blocks(
+                        sys_skip_tokens)
                     logger.info(
                         f"[evict-server] chat: rendered prior-turn "
                         f"({len(evict_msgs)} msgs) -> {len(rendered)} chars "
-                        f"-> {len(evict_tokens)} tokens; calling "
+                        f"-> {len(evict_tokens)} tokens "
+                        f"(skip {sys_skip_blocks} system blocks); calling "
                         f"generator.evict_conversation_prefix")
                     rc = await asyncio.to_thread(
-                        self.generator.evict_conversation_prefix, evict_tokens)
+                        self.generator.evict_conversation_prefix,
+                        evict_tokens, sys_skip_blocks)
                     logger.info(
                         f"[evict-server] chat: evict_conversation_prefix "
-                        f"returned {rc!r} (n_tokens={len(evict_tokens)})")
+                        f"returned {rc!r} (n_tokens={len(evict_tokens)}, "
+                        f"skip_blocks={sys_skip_blocks})")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         f"evict_conversation_prefix(messages) failed (chat): {exc}")

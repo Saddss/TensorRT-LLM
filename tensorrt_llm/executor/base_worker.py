@@ -314,8 +314,11 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_kv_cache_events()
 
-    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+    def evict_conversation_prefix(self, prefix_tokens, skip_blocks: int = 0) -> bool:
         """Issue #13080: forward to KVCacheManager.evict_conversation_prefix.
+
+        ``skip_blocks`` (default 0) protects a leading shared system-prompt
+        prefix from being demoted.
 
         Returns True iff the call reached a pytorch backend's
         KVCacheManager (the only backend that owns a reuse radix tree).
@@ -324,7 +327,7 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm.logger import logger
         n_tokens = len(prefix_tokens) if prefix_tokens is not None else 0
         logger.info(f"[evict] BaseWorker.evict_conversation_prefix called "
-                    f"with {n_tokens} tokens, engine type={type(self.engine).__name__}")
+                    f"with {n_tokens} tokens (skip_blocks={skip_blocks}), engine type={type(self.engine).__name__}")
         if isinstance(self.engine, tllm.Executor):
             logger.info(f"[evict] engine is tllm.Executor (TRT backend); no-op")
             return False
@@ -344,8 +347,8 @@ class BaseWorker(GenerationExecutor):
             logger.warning(f"[evict] kv_mgr ({type(kv_mgr).__name__}) lacks "
                            f"evict_conversation_prefix method")
             return False
-        logger.info(f"[evict] forwarding {n_tokens} tokens to {type(kv_mgr).__name__}")
-        kv_mgr.evict_conversation_prefix(list(prefix_tokens))
+        logger.info(f"[evict] forwarding {n_tokens} tokens (skip_blocks={skip_blocks}) to {type(kv_mgr).__name__}")
+        kv_mgr.evict_conversation_prefix(list(prefix_tokens), skip_blocks=int(skip_blocks))
         logger.info(f"[evict] kv_mgr.evict_conversation_prefix returned (n={n_tokens})")
         return True
 

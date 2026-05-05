@@ -45,7 +45,9 @@
 #include <ostream>
 #include <set>
 #include <string>
+#include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -906,7 +908,10 @@ public:
     //!          re-attach event is impossible at this granularity without race
     //!          conditions) and the walk continues into their children.
     //! \param prefixTokens Token IDs forming the conversation prefix to demote.
-    void evictConversationPrefix(VecTokens const& prefixTokens);
+    //! \param skipBlocks Number of leading blocks to walk through but NOT
+    //!        demote.  Use to protect a shared system-prompt prefix (length
+    //!        of which the caller has computed).  Default 0 = no skip.
+    void evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks = 0);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -1280,6 +1285,23 @@ private:
     radix_block_tree::UnifiedBlockTree* mLookupTree;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
+    // (Previously we kept a private mCachedBlocksRootMutex here for
+    // evictConversationPrefix walks, but it failed to serialize against
+    // storeBlocksForReuse / addSequenceBatch / analyzePrefixReuse -- those
+    // hold mLookupTree's mutex.  We now grab that mutex directly inside
+    // evictConversationPrefix to fix the race; this private member is
+    // intentionally absent.)
+
+    // Issue #13080 instrumentation: track the set of block IDs that were
+    // demoted to priority=0 by ``evictConversationPrefix``.  Used in
+    // getFreeBlock's detach path to distinguish "expected demote->LRU->detach"
+    // events from "non-demoted block also detached" (which would indicate a
+    // collateral side effect of the evict mechanism).  Pure observation,
+    // does not affect behavior.
+    mutable std::unordered_set<int32_t> mDemotedByEvictBlockIds;
+    // Counters reset per evict call period; for diagnosis only.
+    mutable std::atomic<int64_t> mDetachCountDemoted{0};
+    mutable std::atomic<int64_t> mDetachCountNonDemoted{0};
     // KV cache type (self or cross)
     CacheType mCacheType;
     // Eviction Policy
@@ -1423,7 +1445,7 @@ public:
     //! \details A given conversation prefix may be cached at several window
     //!          sizes (full attention + sliding window).  We demote in all of
     //!          them to keep the policy consistent.
-    void evictConversationPrefix(VecTokens const& prefixTokens);
+    void evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks = 0);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1941,7 +1963,7 @@ public:
     //! \details Default implementation does nothing - subclasses that own a
     //! reuse radix tree (e.g. KVCacheManager) override this.  See
     //! WindowBlockManager::evictConversationPrefix for the full semantics.
-    virtual void evictConversationPrefix(VecTokens const& /*prefixTokens*/) {}
+    virtual void evictConversationPrefix(VecTokens const& /*prefixTokens*/, int32_t /*skipBlocks*/ = 0) {}
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
@@ -2336,7 +2358,7 @@ public:
     //! \brief Issue #13080: retroactively demote idle blocks of a conversation
     //! prefix to retention priority 0.  Forwards to BlockManager which fans out
     //! to every WindowBlockManager.
-    void evictConversationPrefix(VecTokens const& prefixTokens) override;
+    void evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks = 0) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

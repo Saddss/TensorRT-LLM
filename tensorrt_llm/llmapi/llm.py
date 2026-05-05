@@ -917,7 +917,7 @@ class BaseLLM:
         return self._executor.aget_stats(timeout=timeout)
 
     @set_api_status("beta")
-    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+    def evict_conversation_prefix(self, prefix_tokens, skip_blocks: int = 0) -> bool:
         """Issue #13080: retroactively demote idle radix-tree entries of a
         conversation's KV prefix to retention priority 0.
 
@@ -929,23 +929,16 @@ class BaseLLM:
         ``canOffload``).  Held blocks are skipped; the walk continues into
         their children.
 
-        The lookup-tree attachment is intentionally preserved: a future
-        prefix-match may still reuse the block before the evictor claims
-        it.  Designed to be called by a multi-turn chat client when it
-        first detects a sliding-window truncation in a conversation: the
-        whole pre-truncation history KV becomes "prefer-evict" without
-        being aggressively detached.
-
-        Args:
-            prefix_tokens: Iterable of integer token IDs forming the
-                conversation prefix to demote.
+        ``skip_blocks`` (default 0) protects a leading shared system-prompt
+        prefix from being demoted.  The walker still advances searchRoot
+        through these blocks but does not change their priority.
 
         Returns:
             True iff the call reached a pytorch backend's ``KVCacheManager``
             (the only backend that owns a reuse radix tree).  TRT-engine
             backends silently no-op and return False.
         """
-        return self._executor.evict_conversation_prefix(prefix_tokens)
+        return self._executor.evict_conversation_prefix(prefix_tokens, skip_blocks=int(skip_blocks))
 
     @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:

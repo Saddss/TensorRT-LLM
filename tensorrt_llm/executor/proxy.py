@@ -504,6 +504,33 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         return result
 
+    def evict_conversation_prefix(self, prefix_tokens, skip_blocks: int = 0) -> bool:
+        """Issue #13080 (IPC): forward evict_conversation_prefix to the
+        worker via the same rpc_client that handles get_stats /
+        get_kv_events.  ``skip_blocks`` (default 0) protects a leading
+        shared system-prompt prefix from demotion.
+
+        Returns True iff the worker reports the call reached its
+        KVCacheManager and demoted at least one block.
+        """
+        if self.rpc_client is None:
+            logger.warning("[ipc_proxy] rpc_client not init; evict skipped")
+            return False
+        n = len(prefix_tokens) if prefix_tokens is not None else 0
+        logger.info(f"[ipc_proxy] evict_conversation_prefix dispatching "
+                    f"{n} tokens (skip_blocks={skip_blocks})")
+        try:
+            result = self.rpc_client.evict_conversation_prefix(
+                prefix_tokens=list(prefix_tokens),
+                skip_blocks=int(skip_blocks)).remote()
+            logger.info(
+                f"[ipc_proxy] evict_conversation_prefix returned {result!r}")
+            return bool(result)
+        except Exception as e:
+            logger.warning(
+                f"[ipc_proxy] evict_conversation_prefix RPC raised: {e!r}")
+            return False
+
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.
 
