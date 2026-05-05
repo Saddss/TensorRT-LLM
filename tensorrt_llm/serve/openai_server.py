@@ -1275,8 +1275,75 @@ class OpenAIServer:
             # special role tokens.
             evict_msgs = getattr(request, "trtllm_kv_evict_prefix_messages", None)
             evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
-            if evict_msgs and self.tokenizer is not None:
+            evict_token_ids = getattr(
+                request, "trtllm_kv_evict_prefix_token_ids", None)
+            evict_skip_blocks_hint = getattr(
+                request, "trtllm_kv_evict_skip_blocks", None)
+            # Issue #13080 v9n fast-path: client supplied tokens directly.
+            # Bypass the entire render+tokenize step (~22 ms at the
+            # workload_g1_t100 prompt size) and call evict immediately.
+            # If skip_blocks is also supplied we skip the system-prompt
+            # tokenization too; otherwise fall back to ``evict_msgs`` only
+            # for that one small piece of work.
+            if evict_token_ids is not None:
                 try:
+                    import time as _t
+                    t_skip0 = _t.perf_counter()
+                    if evict_skip_blocks_hint is not None:
+                        sys_skip_blocks = int(evict_skip_blocks_hint)
+                    elif evict_msgs is not None and self.tokenizer is not None:
+                        sys_skip_tokens = _compute_system_skip_tokens(
+                            evict_msgs, self.tokenizer)
+                        sys_skip_blocks = _compute_system_skip_blocks(
+                            sys_skip_tokens)
+                    else:
+                        sys_skip_blocks = 0
+                    t_enq = _t.perf_counter()
+                    # Issue #13080 v9o: fire-and-forget evict.  The retrospective
+                    # demote does NOT need to complete before generate_async fires
+                    # for THIS request -- this conv's own claimMatchingBlocks
+                    # operates on a different prefix path than the prior chain
+                    # we are demoting.  Letting the evict run concurrently with
+                    # generate_async removes the entire IPC + walk latency from
+                    # the request critical path.
+                    _evict_args = (list(evict_token_ids), sys_skip_blocks)
+                    _t_n_tokens = len(evict_token_ids)
+
+                    def _evict_done(fut, _t0=t_enq, _ntok=_t_n_tokens, _sb=sys_skip_blocks):
+                        try:
+                            _rc = fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                f"evict_conversation_prefix(token_ids) bg-failed (chat): {exc}")
+                            return
+                        _t1 = _t.perf_counter()
+                        logger.info(
+                            f"[evict-timing] FAST_PATH_BG "
+                            f"render_ms=0.0 tokenize_ms=0.0 "
+                            f"skip_ms={(_t0 - t_skip0)*1000:.1f} "
+                            f"bg_ms={(_t1 - _t0)*1000:.1f} "
+                            f"n_tokens={_ntok} "
+                            f"skip_blocks={_sb} rc={_rc}")
+
+                    _task = asyncio.create_task(asyncio.to_thread(
+                        self.generator.evict_conversation_prefix,
+                        *_evict_args))
+                    _task.add_done_callback(_evict_done)
+                    logger.debug(
+                        f"[evict-timing] FAST_PATH_FIRE skip_ms="
+                        f"{(t_enq-t_skip0)*1000:.2f} (deferred to background)")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"evict_conversation_prefix(token_ids) failed (chat): {exc}")
+            elif evict_msgs and self.tokenizer is not None:
+                try:
+                    # Issue #13080 timing: we want a clean breakdown of
+                    # render / tokenize / RPC-roundtrip latency to localize
+                    # the per-truncation overhead observed at high QPS
+                    # (+12% latency at q=6.9 vs baseline).  Each block is
+                    # independent, so per-call timestamps are sufficient.
+                    import time as _t
+                    t_render0 = _t.perf_counter()
                     evict_conv = [
                         ConversationMessage(role=m.get("role"),
                                             content=m.get("content", ""))
@@ -1292,29 +1359,54 @@ class OpenAIServer:
                         chat_template=request.chat_template or self.chat_template,
                         chat_template_kwargs=request.chat_template_kwargs or {},
                     )
+                    t_tok0 = _t.perf_counter()
                     evict_tokens = self.tokenizer.tokenizer.encode(
                         rendered, add_special_tokens=False)
+                    t_skip0 = _t.perf_counter()
                     # Issue #13080: protect the leading system-prompt
                     # blocks from demotion.  Without this guard, the
                     # walker also demotes shared system blocks during
                     # brief idle windows -> future cross-conv hits drop.
-                    sys_skip_tokens = _compute_system_skip_tokens(
-                        evict_msgs, self.tokenizer)
-                    sys_skip_blocks = _compute_system_skip_blocks(
-                        sys_skip_tokens)
-                    logger.info(
-                        f"[evict-server] chat: rendered prior-turn "
-                        f"({len(evict_msgs)} msgs) -> {len(rendered)} chars "
-                        f"-> {len(evict_tokens)} tokens "
-                        f"(skip {sys_skip_blocks} system blocks); calling "
-                        f"generator.evict_conversation_prefix")
-                    rc = await asyncio.to_thread(
+                    if evict_skip_blocks_hint is not None:
+                        sys_skip_blocks = int(evict_skip_blocks_hint)
+                    else:
+                        sys_skip_tokens = _compute_system_skip_tokens(
+                            evict_msgs, self.tokenizer)
+                        sys_skip_blocks = _compute_system_skip_blocks(
+                            sys_skip_tokens)
+                    t_enq = _t.perf_counter()
+                    # Issue #13080 v9o: fire-and-forget (slow path mirror).
+                    _n_msgs = len(evict_msgs)
+                    _n_tok = len(evict_tokens)
+
+                    def _evict_done_slow(fut,
+                                         _r0=t_render0, _t0=t_tok0, _s0=t_skip0,
+                                         _q0=t_enq, _nm=_n_msgs, _nt=_n_tok,
+                                         _sb=sys_skip_blocks):
+                        try:
+                            _rc = fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                f"evict_conversation_prefix(messages) bg-failed (chat): {exc}")
+                            return
+                        _t1 = _t.perf_counter()
+                        logger.info(
+                            f"[evict-timing] BG "
+                            f"render_ms={(_t0-_r0)*1000:.1f} "
+                            f"tokenize_ms={(_s0-_t0)*1000:.1f} "
+                            f"skip_ms={(_q0-_s0)*1000:.1f} "
+                            f"bg_ms={(_t1-_q0)*1000:.1f} "
+                            f"n_msgs={_nm} n_tokens={_nt} "
+                            f"skip_blocks={_sb} rc={_rc}")
+
+                    _task = asyncio.create_task(asyncio.to_thread(
                         self.generator.evict_conversation_prefix,
-                        evict_tokens, sys_skip_blocks)
-                    logger.info(
-                        f"[evict-server] chat: evict_conversation_prefix "
-                        f"returned {rc!r} (n_tokens={len(evict_tokens)}, "
-                        f"skip_blocks={sys_skip_blocks})")
+                        evict_tokens, sys_skip_blocks))
+                    _task.add_done_callback(_evict_done_slow)
+                    logger.debug(
+                        f"[evict-timing] FIRE total_pre_enq_ms="
+                        f"{(t_enq-t_render0)*1000:.2f} "
+                        f"(render+tok+skip done synchronously, RPC deferred)")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         f"evict_conversation_prefix(messages) failed (chat): {exc}")
