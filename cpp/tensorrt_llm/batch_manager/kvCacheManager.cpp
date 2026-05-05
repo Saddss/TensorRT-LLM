@@ -1223,7 +1223,42 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         {
             mEventManager->enqueueRemovedEvent(block, mWindowSize);
         }
+        // Issue #13080 instrumentation: log every detach with full block state
+        // so we can post-process and trace "turn N stored block X at p=35;
+        // who detached X and at what priority?".
+        {
+            auto const id = static_cast<int32_t>(block->getBlockId());
+            auto it = mDemotedByEvictBlockIds.find(id);
+            bool const wasDemoted = it != mDemotedByEvictBlockIds.end();
+            if (wasDemoted)
+            {
+                mDetachCountDemoted.fetch_add(1, std::memory_order_relaxed);
+                mDemotedByEvictBlockIds.erase(it);
+            }
+            else
+            {
+                mDetachCountNonDemoted.fetch_add(1, std::memory_order_relaxed);
+            }
+            // Log every detach for blocks that have content (otherwise it's
+            // just a fresh empty block being claimed for the first time).
+            if (!block->getUniqueTokens().empty())
+            {
+                TLLM_LOG_DEBUG(
+                    "%s::DETACH block_id=%d priority=%d hash=%zu was_demoted=%d cache_level=%s",
+                    mLogPrefix.c_str(), id, block->getPriority(), block->getHash(),
+                    wasDemoted ? 1 : 0,
+                    block->isPrimary() ? "primary" : "secondary");
+            }
+        }
         block->detachFromLookupNode();
+    }
+    // Periodically print summary; cheap.
+    if ((mDetachCountDemoted.load(std::memory_order_relaxed)
+            + mDetachCountNonDemoted.load(std::memory_order_relaxed)) % 1000 == 0)
+    {
+        TLLM_LOG_INFO("%s::getFreeBlock detach stats: demoted=%ld non_demoted=%ld",
+            mLogPrefix.c_str(), mDetachCountDemoted.load(std::memory_order_relaxed),
+            mDetachCountNonDemoted.load(std::memory_order_relaxed));
     }
     // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
@@ -1717,9 +1752,25 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
 
         if (claimed.isPartialMatch && claimed.needsCopy)
         {
-            // Partial match needing copy: allocate new block, copy from source, use new block
+            // Partial match needing copy: allocate new block, copy from source, use new block.
+            //
+            // Issue #13080 fix: use the REQUEST'S own retention priority for
+            // the new block, NOT copySource's priority.  copySource can be a
+            // block that was previously demoted to priority=0 by
+            // ``evictConversationPrefix`` (or any other path that sets a low
+            // priority).  Inheriting that priority would put the new block
+            // (which now holds CURRENT request's KV) into the priority=0
+            // free queue, where LRU consumes it before higher-priority
+            // blocks -- causing this request's just-stored chain to be
+            // detached almost immediately and the next continuation turn to
+            // miss in the radix-tree walk.  This was the root cause of the
+            // catastrophic-miss continuations after a truncation that did
+            // a copy-on-partial-reuse from a demoted prior chain.
             auto copySource = claimed.block;
-            auto newBlock = getFreeBlock(sequence, copySource->getPriority(), copySource->getDurationMs(),
+            auto const retentionPri = claimResult.perBlockRetentions[bi].retentionPriority.value_or(
+                executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+            auto const durationMs = claimResult.perBlockRetentions[bi].durationMs;
+            auto newBlock = getFreeBlock(sequence, retentionPri, durationMs,
                 claimResult.mode, claimResult.directory);
             mTransferManager->onboard(
                 copySource, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
@@ -2381,6 +2432,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
+    SizeType32 numSlotOccupiedSkips = 0; // Issue #13080 instrumentation
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
     // Trim to the shorter of the two inputs so the zip below is always in-bounds.
@@ -2490,6 +2542,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             // storing as children of this node.
             TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: slot occupied by %d, skipping", mLogPrefix.c_str(), bid,
                 (*existing)->getBlockId());
+            ++numSlotOccupiedSkips;
             prevBlock = *existing;
         }
         else
@@ -2513,6 +2566,12 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             storedBlocks.push_back(block);
             prevBlock = block;
             numBlocksStoredForReuse++;
+            // Issue #13080 trace: per-block store with priority + key info (DEBUG-level
+            // so the trace is available with TLLM_LOG_LEVEL=DEBUG without flooding INFO).
+            int const isFullBlock = (static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock) ? 1 : 0;
+            TLLM_LOG_DEBUG("%s::STORE_BLOCK block_id=%d priority=%d depth=%zu hash=%zu n_tokens=%zu is_full=%d",
+                mLogPrefix.c_str(), bid, block->getPriority(), i, block->getHash(),
+                blockKey.uniqueTokens.size(), isFullBlock);
         }
 
         if (pinBlocks)
@@ -2550,6 +2609,18 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
         {
             mEventManager->enqueueStoredEvent(nonPlaceholderStoredBlocks, mWindowSize);
         }
+    }
+    // Issue #13080 instrumentation: log per storeBlocks call to detect cases
+    // where most blocks fail to land due to trie-slot conflicts ("phantom store").
+    // ratio_stored = numBlocksStoredForReuse / numBlocks.  A turn's stored
+    // chain that reports e.g. 5/200 means 195 blocks were skipped due to
+    // existing.has_value()==true at their trie slot -> future continuation
+    // walks will hit those existing blocks (not this request's just-computed
+    // KV).  This is the suspect mechanism for the catastrophic-miss continuations.
+    if (numBlocks > 0)
+    {
+        TLLM_LOG_DEBUG("%s::storeBlocks SUMMARY numBlocks=%zu stored=%d skipped_occupied=%d",
+            mLogPrefix.c_str(), numBlocks, numBlocksStoredForReuse, numSlotOccupiedSkips);
     }
     return {numBlocksStoredForReuse, pinnedBlockIds};
 }
@@ -2890,8 +2961,8 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
         usableUniqueTokenCount = std::min(
             llmRequest->getPromptLen() - 1, usableUniqueTokenCount); // TODO: enable store for completed sequences
     }
-    TLLM_LOG_DEBUG("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
-        mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableUniqueTokenCount);
+    TLLM_LOG_DEBUG("%s::storeBlocksForReuse_BEGIN req=%lu uniqueTokens=%zu usableSize=%zu",
+        mLogPrefix.c_str(), llmRequest->mRequestId, uniqueTokens.size(), usableUniqueTokenCount);
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
@@ -2952,9 +3023,26 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             beam0Blocks.push_back(allocatedBlocks[bi]);
         }
 
+        // Issue #13080 trace: per-request store boundaries (DEBUG-level).  These
+        // are critical for offline lifecycle reconstruction (which req's chain
+        // contains which block) but too verbose to keep at INFO.
+        TLLM_LOG_DEBUG("%s::STORE_BEGIN req=%lu n_keys=%zu n_blocks=%zu",
+            mLogPrefix.c_str(), sequence.getRequestId(), blockKeys.size(), beam0Blocks.size());
+        if (tensorrt_llm::common::Logger::getLogger()->getLevel() <= tensorrt_llm::common::Logger::DEBUG)
+        {
+            std::ostringstream oss;
+            oss << mLogPrefix << "::STORE_CHAIN req=" << sequence.getRequestId() << " ids=[";
+            for (size_t i = 0; i < beam0Blocks.size(); ++i)
+            {
+                if (i) oss << ',';
+                oss << (beam0Blocks[i] ? beam0Blocks[i]->getBlockId() : -999);
+            }
+            oss << "]";
+            TLLM_LOG_DEBUG("%s", oss.str().c_str());
+        }
         auto [numBlocksStoredForReuse, pinnedBlockIds]
             = storeBlocks(std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false);
-        TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
+        TLLM_LOG_DEBUG("%s::STORE_END req=%lu n_stored=%d", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
     // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
@@ -3008,17 +3096,17 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
     }
 }
 
-void BlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
+void BlockManager::evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks)
 {
     // Issue #13080: a given conversation's KV may be cached at several window
     // sizes (e.g. full attention + a sliding window).  Demote in all of them.
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        manager.evictConversationPrefix(prefixTokens);
+        manager.evictConversationPrefix(prefixTokens, skipBlocks);
     }
 }
 
-void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
+void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks)
 {
     // Issue #13080: walk the radix-reuse tree along the conversation prefix
     // and, for every idle (refCount==0) match, demote it to retention
@@ -3050,11 +3138,18 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
         blockKeys.emplace_back(blockTokens);
     }
 
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    // Serialize with storeBlocksForReuse / addSequenceBatch / analyzePrefixReuse
+    // by acquiring the SAME mutex they hold (mLookupTree's recursive mutex).
+    // Previously we held our own mCachedBlocksRootMutex which did NOT serialize
+    // against those paths, allowing the executor's storeBlocksForReuse to run
+    // concurrently with our walker -- racing on eviction policy state.
+    std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
     auto searchRoot = mCachedBlocksRoot;
     SizeType32 demoted = 0;
     SizeType32 skippedActive = 0;
+    SizeType32 skippedSystem = 0;
     SizeType32 missed = 0;
+    SizeType32 walkedIdx = 0;
 
     for (auto const& blockKey : blockKeys)
     {
@@ -3069,6 +3164,22 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
             ++missed;
             break;
         }
+
+        // Issue #13080: protect a configurable system-prompt prefix.  The
+        // first ``skipBlocks`` blocks (which carry the shared system prompt
+        // across conversations) are walked over but NEVER demoted, so that
+        // unrelated conversations that share the system prompt continue to
+        // see those blocks at engine default retention priority.  The
+        // walker still advances searchRoot so deeper conv-specific blocks
+        // can be demoted as usual.
+        if (walkedIdx < skipBlocks)
+        {
+            ++skippedSystem;
+            ++walkedIdx;
+            searchRoot = std::move(matchingBlock);
+            continue;
+        }
+
         if (matchingBlock->hasRefs())
         {
             // Some other live sequence is still using this block; we cannot
@@ -3076,13 +3187,40 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
             // this layer but keep walking children: deeper turns may already
             // be idle.
             ++skippedActive;
+            ++walkedIdx;
             searchRoot = std::move(matchingBlock);
             continue;
         }
 
-        // Idle, exclusive (no other sequence holds a ref).  Reclaim it from
-        // its current priority queue, set priority=0, and re-insert at the
-        // FRONT of the priority-0 queue so it is the very next victim of
+        // Issue #13080 iter2 fix: A block whose trie node has multiple
+        // children is the divergence point for several different chains
+        // (e.g., another conversation that happens to share this exact
+        // prefix has its own child branch here).  Demoting this block ->
+        // LRU evicts -> the trie value is detached, which BREAKS every
+        // other chain that traced through it.  This is the root cause of
+        // the catastrophic-miss victims observed in run13: conv A's prev
+        // chain shares the first user block with conv V; A's evict
+        // demoted that shared block, V's continuation_after_truncation
+        // then missed at depth=5 because the block was already detached.
+        // The safe rule is: only demote when this block lives on a
+        // single linear path in the trie (<= 1 child).  Walk through the
+        // shared block (advancing searchRoot) so deeper, exclusive turns
+        // can still be demoted on this scan.
+        if (matchingBlock->getNextBlocks().size() > 1)
+        {
+            TLLM_LOG_DEBUG("%s::SHARED_SKIP block_id=%d hash=%zu depth=%d n_children=%zu",
+                mLogPrefix.c_str(), matchingBlock->getBlockId(), matchingBlock->getHash(),
+                walkedIdx, matchingBlock->getNextBlocks().size());
+            ++skippedActive;
+            ++walkedIdx;
+            searchRoot = std::move(matchingBlock);
+            continue;
+        }
+
+        // Idle, exclusive (no other sequence holds a ref, no multi-branch
+        // divergence at this trie node).  Reclaim it from its current
+        // priority queue, set priority=0, and re-insert at the FRONT of
+        // the priority-0 queue so it is the very next victim of
         // getFreeBlock.  priority < secondary_offload_min_priority(30) flips
         // canOffload to false, so the evictor will skip the wasteful D2H
         // offload.  We deliberately do NOT detachFromLookupNode here: a
@@ -3093,7 +3231,18 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
             matchingBlock, /*priority=*/executor::KvCacheRetentionConfig::kMinRetentionPriority,
             /*durationMs=*/std::nullopt);
         mEvictionPolicy->releaseBlock(matchingBlock, /*toFront=*/true);
+        // Track this block as having been demoted by us, so getFreeBlock's
+        // detach path can distinguish "expected: demoted block hits LRU"
+        // vs "unexpected: non-demoted block was detached" (collateral).
+        mDemotedByEvictBlockIds.insert(static_cast<int32_t>(matchingBlock->getBlockId()));
+        // Issue #13080 trace: per-block demote (DEBUG-level; the aggregate
+        // ``evictConversationPrefix - demoted=N skipped_system=M ...`` log is
+        // kept at INFO so operators see one line per call).
+        TLLM_LOG_DEBUG("%s::DEMOTE block_id=%d hash=%zu depth=%d",
+            mLogPrefix.c_str(), matchingBlock->getBlockId(),
+            matchingBlock->getHash(), walkedIdx);
         ++demoted;
+        ++walkedIdx;
         searchRoot = std::move(matchingBlock);
     }
 
@@ -3102,8 +3251,9 @@ void WindowBlockManager::evictConversationPrefix(VecTokens const& prefixTokens)
     // from "API never reached".  Issue #13080 micro_validate_evict.py
     // relies on this line as ground truth.
     TLLM_LOG_INFO(
-        "%s::evictConversationPrefix - demoted=%d skipped_active=%d miss=%d (chain_depth=%zu, prefix_tokens=%zu)",
-        mLogPrefix.c_str(), demoted, skippedActive, missed, blockKeys.size(), prefixTokens.size());
+        "%s::evictConversationPrefix - demoted=%d skipped_system=%d skipped_active=%d miss=%d (chain_depth=%zu, prefix_tokens=%zu, skip_blocks=%d)",
+        mLogPrefix.c_str(), demoted, skippedSystem, skippedActive, missed, blockKeys.size(), prefixTokens.size(),
+        skipBlocks);
 }
 
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
@@ -3785,16 +3935,16 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
     mBlockManager.schedulingReleaseBlocks(requestId);
 }
 
-void KVCacheManager::evictConversationPrefix(VecTokens const& prefixTokens)
+void KVCacheManager::evictConversationPrefix(VecTokens const& prefixTokens, int32_t skipBlocks)
 {
-    TLLM_LOG_TRACE("[%s]::%s start (prefix_len=%zu)", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__,
-        prefixTokens.size());
+    TLLM_LOG_TRACE("[%s]::%s start (prefix_len=%zu, skip_blocks=%d)", isCrossKv() ? "CROSS" : "SELF",
+        __PRETTY_FUNCTION__, prefixTokens.size(), skipBlocks);
     if (!mEnableBlockReuse)
     {
         TLLM_LOG_DEBUG("evictConversationPrefix: block reuse disabled, nothing to demote");
         return;
     }
-    mBlockManager.evictConversationPrefix(prefixTokens);
+    mBlockManager.evictConversationPrefix(prefixTokens, skipBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
 }
 

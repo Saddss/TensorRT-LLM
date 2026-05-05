@@ -120,9 +120,10 @@ class GenerationExecutor(ABC):
     def abort_request(self, request_id: int) -> None:
         pass
 
-    def evict_conversation_prefix(self, prefix_tokens) -> bool:
+    def evict_conversation_prefix(self, prefix_tokens, skip_blocks: int = 0) -> bool:
         """Issue #13080: retroactively demote idle radix-tree entries of a
-        conversation's KV prefix to retention priority 0.
+        conversation's KV prefix to retention priority 0.  ``skip_blocks``
+        (default 0) protects a leading shared system-prompt prefix.
 
         Default no-op so OpenAI-server callers can use the hint
         unconditionally; concrete subclasses (Proxy / RpcProxy / Worker)

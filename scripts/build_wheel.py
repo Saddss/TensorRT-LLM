@@ -654,7 +654,7 @@ def main(*,
         build_flash_mla = "OFF"
     else:
         targets.extend([
-            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
+            "th_common", "bindings", "deep_gemm", "pg_utils",
             "flash_mla"
         ])
         build_pyt = "ON"
@@ -1007,7 +1007,10 @@ def main(*,
         binding_lib_file_name = binding_lib_dir.name
         install_file(binding_lib_dir, pkg_dir)
 
-        with (build_dir / "tensorrt_llm" / "deep_ep" /
+        deep_ep_arch_file = build_dir / "tensorrt_llm" / "deep_ep" / "cuda_architectures.txt"
+        deep_ep_cuda_architectures = ""
+        if deep_ep_arch_file.exists():
+          with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
             deep_ep_cuda_architectures = f.read().strip().strip(";")
         if deep_ep_cuda_architectures:
