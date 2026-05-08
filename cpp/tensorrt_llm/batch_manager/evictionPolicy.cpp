@@ -58,6 +58,7 @@ constexpr auto defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     SizeType32 startIdx = 0;
 
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).
@@ -85,6 +86,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 
 void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     auto const len = static_cast<SizeType32>(allPlaceholderBlocksById.size());
 
     // Placeholder IDs -2, -3, ... map to indices 2, 3, ... via abs(id).
@@ -105,6 +107,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 
 bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
         = {[](BlockPtr const& block) { return block->isPrimary(); },
@@ -139,6 +142,7 @@ bool LRUEvictionPolicy::verifyQueueIntegrity() const
 
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
 
     for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
@@ -167,6 +171,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
     // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
     TLLM_CHECK_WITH_INFO(
@@ -207,6 +212,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 
 SizeType32 LRUEvictionPolicy::getNumFreeBlocks(SizeType32 cacheLevel)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     return mNumFreeBlocksPerLevel[cacheLevel];
 }
 
@@ -218,6 +224,7 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
 void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
 
@@ -245,6 +252,7 @@ std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() con
 
 void LRUEvictionPolicy::refresh()
 {
+    std::lock_guard<std::recursive_mutex> lock(mMutex);
     while (!mExpiringBlockHeap.empty())
     {
         auto const block = *mExpiringBlockHeap.begin();

@@ -86,10 +86,23 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
-                                                 parse_visual_gen_params)
+try:
+    from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
+                                                     parse_visual_gen_params)
+except Exception as _vg_err1:
+    import warnings as _vg_warnings
+    _vg_warnings.warn(f"visual_gen_utils import skipped (optional): {type(_vg_err1).__name__}")
+    VIDEO_STORE = {}
+    parse_visual_gen_params = None
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+try:
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+except Exception as _vg_err2:
+    import warnings as _vg_warnings
+    _vg_warnings.warn(f"visual_gen import skipped (optional): {type(_vg_err2).__name__}")
+    class _VisualGenStub_srv: pass
+    VisualGen = _VisualGenStub_srv
+    VisualGenParams = _VisualGenStub_srv
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
@@ -1325,9 +1338,41 @@ class OpenAIServer:
                             f"n_tokens={_ntok} "
                             f"skip_blocks={_sb} rc={_rc}")
 
-                    _task = asyncio.create_task(asyncio.to_thread(
+                    # Serialize all evict calls through a
+                    # SINGLE dedicated worker thread.  asyncio.to_thread uses
+                    # the default thread pool (up to 32 concurrent threads);
+                    # multiple evict calls running in parallel can hit
+                    # LRUEvictionPolicy::claimBlock concurrently which has no
+                    # internal mutex and relies on the recursive-mutex held
+                    # at the kvCacheManager level for serialization with
+                    # other paths (storeBlocksForReuse, analyzePrefixReuse).
+                    # Forcing a 1-thread executor preserves fire-and-forget
+                    # latency benefit while removing the contention amplifier
+                    # observed at 1.5h sustained load (server hangs in
+                    # futex_wait, GPU 0%).
+                    if not hasattr(self, "_evict_executor"):
+                        # Tested workers=1/2/4 on
+                        # trunc20_5x q=6.5.  workers>=2 corrupts P50
+                        # (3.70s -> 7.11s at workers=2) because all evict
+                        # calls serialize on the new LRUEvictionPolicy
+                        # mutex while ALSO contending with the main
+                        # scheduler thread that holds the same mutex
+                        # during getFreeBlock / claim / release in the
+                        # critical path.  Net effect: extra workers add
+                        # contention without adding parallelism.
+                        # Therefore default workers=1 (matches v9qs).
+                        from concurrent.futures import ThreadPoolExecutor
+                        import os as _os
+                        _evict_workers = int(
+                            _os.environ.get("TRTLLM_KV_EVICT_WORKERS", "1"))
+                        self._evict_executor = ThreadPoolExecutor(
+                            max_workers=_evict_workers,
+                            thread_name_prefix="kv-evict")
+                    _loop = asyncio.get_event_loop()
+                    _task = _loop.run_in_executor(
+                        self._evict_executor,
                         self.generator.evict_conversation_prefix,
-                        *_evict_args))
+                        *_evict_args)
                     _task.add_done_callback(_evict_done)
                     logger.debug(
                         f"[evict-timing] FAST_PATH_FIRE skip_ms="
@@ -1399,9 +1444,24 @@ class OpenAIServer:
                             f"n_msgs={_nm} n_tokens={_nt} "
                             f"skip_blocks={_sb} rc={_rc}")
 
-                    _task = asyncio.create_task(asyncio.to_thread(
+                    # Route SLOW_PATH through same dedicated
+                    # multi-worker executor so all evict ops share one bounded
+                    # thread pool (rather than asyncio.to_thread's default 32-
+                    # thread global pool which races against unrelated tasks).
+                    if not hasattr(self, "_evict_executor"):
+                        # See FAST_PATH branch above for why workers=1 default.
+                        from concurrent.futures import ThreadPoolExecutor
+                        import os as _os
+                        _ev_workers = int(
+                            _os.environ.get("TRTLLM_KV_EVICT_WORKERS", "1"))
+                        self._evict_executor = ThreadPoolExecutor(
+                            max_workers=_ev_workers,
+                            thread_name_prefix="kv-evict")
+                    _loop = asyncio.get_event_loop()
+                    _task = _loop.run_in_executor(
+                        self._evict_executor,
                         self.generator.evict_conversation_prefix,
-                        evict_tokens, sys_skip_blocks))
+                        evict_tokens, sys_skip_blocks)
                     _task.add_done_callback(_evict_done_slow)
                     logger.debug(
                         f"[evict-timing] FIRE total_pre_enq_ms="

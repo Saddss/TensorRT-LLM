@@ -590,6 +590,15 @@ class KVCacheManager(BaseResourceManager):
             'max_sequence_length': self.max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
+            # PyTorch executor was forgetting to forward
+            # ``secondary_offload_min_priority`` from KvCacheConfig to the
+            # C++ KVCacheManager constructor.  Without this, the C++
+            # default (30) is always used, so user-supplied values like
+            # ``secondary_offload_min_priority: 0`` were silently ignored
+            # -> priority=0 demoted blocks ALWAYS bypassed D2H, even when
+            # the operator wanted them to populate secondary cache.
+            'secondary_offload_min_priority':
+                kv_cache_config.secondary_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,

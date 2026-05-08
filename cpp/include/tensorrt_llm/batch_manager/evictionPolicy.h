@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
 #include <chrono>
+#include <mutex>
 #include <vector>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
@@ -114,6 +115,17 @@ private:
             return id >= 0 ? positive[id] : negative[-id];
         }
     };
+
+    // Serialize all mutating ops on the queues below.
+    // Recursive: callers in kvCacheManager.cpp may already hold this mutex
+    // when invoking helpers that re-enter (e.g. releaseBlock from within a
+    // claim/release sequence in getFreeBlock).  Without this lock, multiple
+    // evict_conversation_prefix workers concurrently mutate
+    // mFreeQueues / mFreeBlockIterators / mNumFreeBlocksPerLevel /
+    // mExpiringBlockHeap and corrupt STL iterator state, eventually deadlocking
+    // the main scheduler.  Adding the lock allows the Python-side
+    // ThreadPoolExecutor to be scaled up beyond max_workers=1 safely.
+    mutable std::recursive_mutex mMutex;
 
     // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
     // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder
