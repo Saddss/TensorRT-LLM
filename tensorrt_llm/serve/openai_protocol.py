@@ -394,30 +394,30 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
-    # Issue #13080: per-request KV-cache retention priority hint.
-    # When set (typically 0 on a sliding-window-truncated turn), the server
-    # tags BOTH the prompt (context-phase) AND decode-phase blocks of this
-    # request with the supplied retention priority.  Values strictly less
-    # than ``secondary_offload_min_priority`` (default 30) make these blocks
-    # the next eviction victims AND skip the wasteful D2H offload, freeing
-    # primary KV cache slots for non-truncated conversations whose prefix
-    # reuse is still valuable.  Default ``None`` means "use engine default
-    # (35)" and is a no-op.
+    # Per-request KV-cache retention priority hint.  When set (typically
+    # 0 on a sliding-window-truncated turn), the server tags BOTH the
+    # prompt (context-phase) AND decode-phase blocks of this request
+    # with the supplied retention priority.  Values strictly less than
+    # ``secondary_offload_min_priority`` (default 30) make these blocks
+    # the next eviction victims AND skip the wasteful D2H offload,
+    # freeing primary KV cache slots for non-truncated conversations
+    # whose prefix reuse is still valuable.  Default ``None`` means "use
+    # engine default (35)" and is a no-op.
     trtllm_kv_retention_priority: Optional[int] = Field(
         default=None, ge=0, le=100,
         description=(
-            "TensorRT-LLM extension (Issue #13080).  Per-request KV "
-            "retention priority in [0, 100] applied to both prompt and "
-            "decode blocks.  Set 0 on a sliding-window-truncated turn so "
-            "its blocks are reclaimed first by the LRU evictor and skip "
-            "D2H offload (priority < secondary_offload_min_priority=30)."))
+            "TensorRT-LLM extension.  Per-request KV retention priority "
+            "in [0, 100] applied to both prompt and decode blocks.  Set "
+            "0 on a sliding-window-truncated turn so its blocks are "
+            "reclaimed first by the LRU evictor and skip D2H offload "
+            "(priority < secondary_offload_min_priority=30)."))
 
-    # Issue #13080 TensorRT-LLM extension: retroactively demote idle
-    # radix-tree entries of a conversation's prior prompt to retention
-    # priority 0.  When set, the server tokenises this string with the
-    # model's chat template and walks the reuse tree along the resulting
-    # token sequence; every match whose hasRefs()==0 is moved to the head
-    # of the priority-0 free queue (next eviction victim AND no D2H
+    # TensorRT-LLM extension: retroactively demote idle radix-tree
+    # entries of a conversation's prior prompt to retention priority 0.
+    # When set, the server tokenises this string with the model's chat
+    # template and walks the reuse tree along the resulting token
+    # sequence; every match whose hasRefs()==0 is moved to the head of
+    # the priority-0 free queue (next eviction victim AND no D2H
     # offload).  Intended for the FIRST sliding-window truncation in a
     # conversation: pass the conversation's full pre-truncation prompt
     # string so the entire history KV becomes prefer-evict at once.
@@ -426,9 +426,23 @@ class CompletionRequest(OpenAIBaseModel):
         description=("TensorRT-LLM extension.  When set, the server "
                      "tokenises this rendered prompt string and demotes "
                      "all matching idle blocks in the KV reuse tree to "
-                     "retention priority 0 (Issue #13080, retrospective "
-                     "demotion).  Use on the first truncation per "
-                     "conversation."))
+                     "retention priority 0 (retrospective demotion).  "
+                     "Use on the first truncation per conversation."))
+
+    # Server-side eviction migration (Step 1).  See ChatCompletionRequest
+    # docstring; for completion requests the prior-turn cache stores the
+    # raw prompt text instead of a messages list.
+    enable_kv_evict: Optional[bool] = Field(
+        default=None,
+        description=("TensorRT-LLM extension.  When True on a "
+                     "sliding-window-truncated turn, the server reads the "
+                     "conversation's previous turn's prompt from its "
+                     "per-conv cache and demotes those KV blocks.  "
+                     "Requires the request to carry a non-empty "
+                     "``X-Flow-Conversation-Id`` header.  When the cache "
+                     "has no prior entry, the demotion is a no-op but the "
+                     "current prompt is still recorded for the next "
+                     "truncation."))
 
     # doc: end-completion-extra-params
 
@@ -792,33 +806,32 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "to limit the kv cache reuse on with the requests having the same string."
          ))
 
-    # Issue #13080: see CompletionRequest for full description.
+    # See CompletionRequest for full description.
     trtllm_kv_retention_priority: Optional[int] = Field(
         default=None, ge=0, le=100,
         description=(
-            "TensorRT-LLM extension (Issue #13080).  Per-request KV "
-            "retention priority in [0, 100] applied to both prompt and "
-            "decode blocks.  Set 0 on a sliding-window-truncated turn so "
-            "its blocks are reclaimed first by the LRU evictor and skip "
-            "D2H offload (priority < secondary_offload_min_priority=30)."))
+            "TensorRT-LLM extension.  Per-request KV retention priority "
+            "in [0, 100] applied to both prompt and decode blocks.  Set "
+            "0 on a sliding-window-truncated turn so its blocks are "
+            "reclaimed first by the LRU evictor and skip D2H offload "
+            "(priority < secondary_offload_min_priority=30)."))
 
-    # Issue #13080: see CompletionRequest for full description.
+    # See CompletionRequest for full description.
     trtllm_kv_evict_prefix_text: Optional[str] = Field(
         default=None,
         description=("TensorRT-LLM extension.  When set, the server "
                      "tokenises this rendered prompt string and demotes "
                      "all matching idle blocks in the KV reuse tree to "
-                     "retention priority 0 (Issue #13080, retrospective "
-                     "demotion).  Use on the first truncation per "
-                     "conversation."))
+                     "retention priority 0 (retrospective demotion).  "
+                     "Use on the first truncation per conversation."))
 
-    # Issue #13080: PREFERRED retrospective-demote field for chat clients.
-    # Pass the FULL conversation history that was sent on the *previous*
-    # turn, i.e. ``current_messages[:-1]`` (strip the new user message).
+    # PREFERRED retrospective-demote field for chat clients.  Pass the
+    # FULL conversation history that was sent on the *previous* turn,
+    # i.e. ``current_messages[:-1]`` (strip the new user message).
     # Server applies the same ``apply_chat_template`` + tokenize pipeline
     # that originally stored those blocks in the radix tree, so the
     # resulting tokens match the stored BlockKeys exactly.  Use this
-    # instead of ``trtllm_kv_evict_prefix_text`` for chat completion -
+    # instead of ``trtllm_kv_evict_prefix_text`` for chat completion --
     # the text variant fails to match because it skips the chat
     # template's special tokens (<|im_start|>, <|im_end|>, role tags).
     trtllm_kv_evict_prefix_messages: Optional[List[Dict[str, Any]]] = Field(
@@ -829,14 +842,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "result, and demotes every matching idle block in "
                      "the KV reuse tree to retention priority 0.  This "
                      "is the chat-correct analogue of "
-                     "trtllm_kv_evict_prefix_text (Issue #13080).  Set "
-                     "to current_messages[:-1] on the first truncation "
-                     "per conversation."))
+                     "trtllm_kv_evict_prefix_text.  Set to "
+                     "current_messages[:-1] on the first truncation per "
+                     "conversation."))
 
-    # Issue #13080 v9n optimization: client supplies the prior-turn token
-    # IDs directly.  Bypasses the server-side render+tokenize step which
-    # is the largest fraction of evict-call overhead (22.6 ms / 34.7 ms
-    # total at q=6.9 in the workload_g1_t100 measurement).  Use this
+    # Optimization: client supplies the prior-turn token IDs directly.
+    # Bypasses the server-side render+tokenize step which is the largest
+    # fraction of evict-call overhead (~22 ms / ~35 ms total).  Use this
     # field instead of ``trtllm_kv_evict_prefix_messages`` whenever the
     # client already has tokenization (e.g. a chat backend that caches
     # turn-by-turn tokens).  ``trtllm_kv_evict_skip_blocks`` is the
@@ -849,24 +861,48 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # entirely.
     trtllm_kv_evict_prefix_token_ids: Optional[List[int]] = Field(
         default=None,
-        description=("TensorRT-LLM extension (Issue #13080).  Direct "
-                     "token-id list for the conversation's prior turn, "
-                     "used to demote matching idle radix-tree entries "
-                     "to retention priority 0.  Skips the server-side "
-                     "render+tokenize step.  Pair with "
-                     "``trtllm_kv_evict_skip_blocks`` to also skip the "
-                     "system-prompt computation."))
+        description=("TensorRT-LLM extension.  Direct token-id list for "
+                     "the conversation's prior turn, used to demote "
+                     "matching idle radix-tree entries to retention "
+                     "priority 0.  Skips the server-side render+tokenize "
+                     "step.  Pair with ``trtllm_kv_evict_skip_blocks`` "
+                     "to also skip the system-prompt computation."))
     trtllm_kv_evict_skip_blocks: Optional[int] = Field(
         default=None,
-        description=("TensorRT-LLM extension (Issue #13080).  Number of "
-                     "leading KV blocks to walk-but-not-demote when "
-                     "processing ``trtllm_kv_evict_prefix_token_ids`` / "
+        description=("TensorRT-LLM extension.  Number of leading KV "
+                     "blocks to walk-but-not-demote when processing "
+                     "``trtllm_kv_evict_prefix_token_ids`` / "
                      "``trtllm_kv_evict_prefix_messages``.  Use this to "
                      "protect a shared system-prompt prefix.  When "
                      "omitted on the messages path, the server "
                      "computes a safe value via ceiling-divide of the "
                      "system-text token count plus a 2-block safety "
                      "buffer for chat-template wrapping."))
+
+    # Server-side eviction migration (Step 1).  When set to True on a
+    # sliding-window-truncated turn, the server looks up the conversation's
+    # prior turn's messages from its per-conversation cache (keyed by the
+    # ``X-Flow-Conversation-Id`` request header), renders them through the
+    # same chat-template + tokenize pipeline used at the time those KV blocks
+    # were originally stored, and demotes the matching idle radix-tree
+    # entries to retention priority 0.  Replaces the client-side fast path
+    # (``trtllm_kv_evict_prefix_token_ids`` + ``trtllm_kv_evict_skip_blocks``)
+    # with a one-bit flag on the request body.  When the per-conversation
+    # cache has no prior entry (first turn / TTL expired / cache evicted /
+    # missing conversation id), the server silently no-ops the demotion;
+    # the current turn's messages are still recorded so that the next
+    # truncated turn on the same conversation can be served correctly.
+    enable_kv_evict: Optional[bool] = Field(
+        default=None,
+        description=("TensorRT-LLM extension.  When True on a "
+                     "sliding-window-truncated turn, the server reads the "
+                     "conversation's previous turn from its per-conv cache "
+                     "and demotes those KV blocks.  Requires the request "
+                     "to carry a non-empty ``X-Flow-Conversation-Id`` "
+                     "header so the server can identify the conversation. "
+                     "When the cache has no prior entry, the demotion is a "
+                     "no-op but the current turn is still recorded for the "
+                     "next truncation."))
 
     # doc: end-chat-completion-extra-params
 

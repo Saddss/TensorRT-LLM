@@ -111,17 +111,134 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
-# Issue #13080: KV cache page size used by trtllm by default.  Used to
-# convert a system-prompt token count into a block count for the
-# ``skip_blocks`` parameter of ``evict_conversation_prefix``.
+# KV cache page size used by trtllm by default.  Used to convert a
+# system-prompt token count into a block count for the ``skip_blocks``
+# parameter of ``evict_conversation_prefix``.
 _KV_BLOCK_SIZE_TOKENS = 32
 
 
+# === Server-side eviction migration (Step 1) state ============================
+# When TRTLLM_KV_EVICT_SERVER_MIGRATE=1, the chat / completion handlers
+# maintain a per-conversation cache of the previous turn's request payload.
+# On a turn that arrives with ``enable_kv_evict=True`` (set by the client
+# whenever a sliding-window truncation just happened), the server reads the
+# prior entry from this cache and feeds it into ``evict_conversation_prefix``
+# - the same evict pipeline the client-side fast path used to drive
+# directly via ``trtllm_kv_evict_prefix_token_ids``.  The current turn is
+# always recorded into the cache, regardless of whether ``enable_kv_evict``
+# is set; the client may omit the flag on the *first* turn after the
+# eviction-affecting event because the prior entry is what matters, not
+# this one.  Conversation identity is taken from the
+# ``X-Flow-Conversation-Id`` request header (already injected by
+# chat-service for all outbound LLM calls); when missing or empty we
+# silently skip both the read and the write so the path is identical to
+# the legacy code.
+import threading as _serv_mig_threading
+from collections import OrderedDict as _serv_mig_OrderedDict
+
+_KV_EVICT_SERVER_MIGRATE = (
+    os.environ.get("TRTLLM_KV_EVICT_SERVER_MIGRATE", "0").strip() == "1")
+_KV_EVICT_CACHE_MAX_ENTRIES = int(
+    os.environ.get("TRTLLM_KV_EVICT_CACHE_MAX_ENTRIES", "32768"))
+_KV_EVICT_CACHE_TTL_SEC = float(
+    os.environ.get("TRTLLM_KV_EVICT_CACHE_TTL_SEC", "1800"))
+_KV_EVICT_CONV_ID_HEADER = "x-flow-conversation-id"
+
+
+class _PrevTurnCache:
+    """Per-conversation cache of the previous turn's evict-input payload.
+
+    Mirrors the client-side ``_last_messages`` / ``_last_prompt_text``
+    structures in ``online_replay_with_hints.py``: at the end of each turn
+    the server records the payload that, if the *next* turn carries
+    ``enable_kv_evict=True``, will be replayed through the chat-template +
+    tokenize pipeline exactly the same way the client used to do.  Two
+    payload kinds are stored side-by-side because chat and completion
+    requests do not share a common "prior turn" representation:
+
+    - ``messages``: list of OpenAI-style message dicts, used for
+      ``ChatCompletionRequest`` (the entry's value goes into
+      ``apply_chat_template(add_generation_prompt=False)``).
+    - ``prompt_text``: raw rendered prompt string, used for
+      ``CompletionRequest`` (the entry's value goes straight into
+      ``tokenizer.encode(add_special_tokens=False)``).
+
+    A simple ``OrderedDict`` + ``threading.Lock`` is plenty: chat /
+    completion handlers run in a single asyncio loop, but the
+    fire-and-forget evict callbacks may dispatch through a
+    ``ThreadPoolExecutor`` at log time, so a lock is required.  The
+    eviction policy is plain LRU with a wall-clock TTL.
+    """
+
+    def __init__(self,
+                 max_entries: int = _KV_EVICT_CACHE_MAX_ENTRIES,
+                 ttl_sec: float = _KV_EVICT_CACHE_TTL_SEC) -> None:
+        self._d: "_serv_mig_OrderedDict[str, tuple[Any, float]]" = (
+            _serv_mig_OrderedDict())
+        self._lock = _serv_mig_threading.Lock()
+        self._max_entries = max_entries
+        self._ttl_sec = ttl_sec
+
+    def get(self, conv_id: str):
+        if not conv_id:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            entry = self._d.get(conv_id)
+            if entry is None:
+                return None
+            value, ts = entry
+            if (now - ts) > self._ttl_sec:
+                self._d.pop(conv_id, None)
+                return None
+            self._d.move_to_end(conv_id)
+            return value
+
+    def put(self, conv_id: str, value) -> None:
+        if not conv_id:
+            return
+        ts = time.monotonic()
+        with self._lock:
+            if conv_id in self._d:
+                self._d.move_to_end(conv_id)
+            self._d[conv_id] = (value, ts)
+            while len(self._d) > self._max_entries:
+                self._d.popitem(last=False)
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._d)
+
+
+# Two caches: one for chat (messages list), one for completion (prompt str).
+_PREV_CHAT_MESSAGES_CACHE = _PrevTurnCache()
+_PREV_COMPLETION_PROMPT_CACHE = _PrevTurnCache()
+
+
+def _conv_id_from_request(raw_request: Optional[Request]) -> str:
+    """Extract conversation id from the X-Flow-Conversation-Id header.
+
+    Returns the empty string when the header is absent / empty / the
+    request itself is None.  Callers rely on the empty-string sentinel to
+    short-circuit cache reads/writes (``_PrevTurnCache.get`` / ``.put``
+    accept and return empty cleanly)."""
+    if raw_request is None:
+        return ""
+    try:
+        cid = raw_request.headers.get(_KV_EVICT_CONV_ID_HEADER, "")
+    except Exception:  # noqa: BLE001
+        return ""
+    return (cid or "").strip()
+
+
+# === end Step 1 state =========================================================
+
+
 def _compute_system_skip_tokens(messages, tokenizer) -> int:
-    """Issue #13080: estimate how many leading tokens of a rendered
-    chat prompt are part of the SYSTEM prompt (i.e. shared across
-    conversations).  We use the simplest definition: walk ``messages``
-    from the start and gather all consecutive role==system entries.
+    """Estimate how many leading tokens of a rendered chat prompt are
+    part of the SYSTEM prompt (i.e. shared across conversations).  We
+    use the simplest definition: walk ``messages`` from the start and
+    gather all consecutive role==system entries.
     Tokenize that with ``add_special_tokens=False`` (the chat-template
     path renders system messages without the BOS).  The exact count
     doesn't have to be precise -- we want it to be a CONSERVATIVE
@@ -162,8 +279,8 @@ def _compute_system_skip_tokens(messages, tokenizer) -> int:
 
 
 def _compute_system_skip_blocks(sys_text_tokens: int, kv_block_size: int = _KV_BLOCK_SIZE_TOKENS) -> int:
-    """Issue #13080 iter2 fix: convert a bare-system-text token count to a
-    SAFE block count for ``evict_conversation_prefix(skip_blocks=...)``.
+    """Convert a bare-system-text token count to a SAFE block count for
+    ``evict_conversation_prefix(skip_blocks=...)``.
 
     Three corrections vs. naive floor division:
       1. CEILING division so the last partial system block is fully covered.
@@ -190,8 +307,8 @@ def _compute_system_skip_blocks(sys_text_tokens: int, kv_block_size: int = _KV_B
 
 
 def _build_kv_retention_config(retention_priority):
-    """Issue #13080: build a ``KvCacheRetentionConfig`` that applies the
-    supplied priority to BOTH the prompt (context phase) AND decode blocks.
+    """Build a ``KvCacheRetentionConfig`` that applies the supplied
+    priority to BOTH the prompt (context phase) AND decode blocks.
 
     The token-range list MUST cover the whole prompt: leaving it empty makes
     ``getPerBlockRetentionPriorityDuration()`` return ``nullopt`` for every
@@ -1276,7 +1393,153 @@ class OpenAIServer:
             kv_retention_config = _build_kv_retention_config(
                 getattr(request, "trtllm_kv_retention_priority", None))
 
-            # Issue #13080 retrospective demotion (CHAT-CORRECT path).
+            # === Server-side eviction migration (Step 1) ======================
+            # When the per-process flag is on AND the client set
+            # ``enable_kv_evict=True`` for this request (typically right after
+            # a sliding-window truncation), look up the conversation's prior
+            # turn from the per-conv cache and short-circuit the legacy
+            # ``trtllm_kv_evict_prefix_*`` evaluation below.  This block
+            # mirrors what ``online_replay_with_hints._tokenize_messages``
+            # used to do client-side: render with
+            # ``add_generation_prompt=False``, encode without special tokens,
+            # compute ``skip_blocks`` from the prior-turn system text, then
+            # fire-and-forget through ``self._evict_executor``.  Behaviour is
+            # block-level equivalent to the legacy SLOW_PATH branch
+            # (``elif evict_msgs and self.tokenizer is not None:``).
+            #
+            # The current turn's messages are recorded into the cache below,
+            # AFTER the lookup, so a same-conv concurrent request that arrives
+            # before this one finishes still sees the older entry - which is
+            # the desired behaviour (that older entry is what is currently in
+            # the KV reuse tree at the time the concurrent request demotes).
+            _migrate_conv_id = ""
+            _migrate_evict_handled = False
+            if _KV_EVICT_SERVER_MIGRATE:
+                _migrate_conv_id = _conv_id_from_request(raw_request)
+                _migrate_enable_evict = bool(
+                    getattr(request, "enable_kv_evict", False))
+                if (_migrate_enable_evict and _migrate_conv_id
+                        and self.tokenizer is not None):
+                    _prev_msgs = _PREV_CHAT_MESSAGES_CACHE.get(
+                        _migrate_conv_id)
+                    if _prev_msgs:
+                        try:
+                            import time as _t
+                            t_render0 = _t.perf_counter()
+                            evict_conv = [
+                                ConversationMessage(role=m.get("role"),
+                                                    content=m.get("content", ""))
+                                for m in _prev_msgs
+                            ]
+                            rendered: str = apply_chat_template(
+                                model_type=self.model_config.model_type,
+                                tokenizer=self.tokenizer,
+                                processor=self.processor,
+                                conversation=evict_conv,
+                                add_generation_prompt=False,
+                                mm_placeholder_counts=[{} for _ in evict_conv],
+                                chat_template=request.chat_template
+                                or self.chat_template,
+                                chat_template_kwargs=request.chat_template_kwargs
+                                or {},
+                            )
+                            t_tok0 = _t.perf_counter()
+                            evict_tokens = self.tokenizer.tokenizer.encode(
+                                rendered, add_special_tokens=False)
+                            t_skip0 = _t.perf_counter()
+                            sys_skip_tokens = _compute_system_skip_tokens(
+                                _prev_msgs, self.tokenizer)
+                            sys_skip_blocks = _compute_system_skip_blocks(
+                                sys_skip_tokens)
+                            t_enq = _t.perf_counter()
+                            _n_msgs = len(_prev_msgs)
+                            _n_tok = len(evict_tokens)
+
+                            def _evict_done_migrate(
+                                    fut,
+                                    _r0=t_render0, _t0=t_tok0, _s0=t_skip0,
+                                    _q0=t_enq, _nm=_n_msgs, _nt=_n_tok,
+                                    _sb=sys_skip_blocks,
+                                    _cid=_migrate_conv_id):
+                                try:
+                                    _rc = fut.result()
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning(
+                                        "evict_conversation_prefix(server-"
+                                        f"migrate) bg-failed (chat): {exc}")
+                                    return
+                                _t1 = _t.perf_counter()
+                                logger.info(
+                                    f"[evict-server-migrate] BG conv={_cid} "
+                                    f"render_ms={(_t0-_r0)*1000:.1f} "
+                                    f"tokenize_ms={(_s0-_t0)*1000:.1f} "
+                                    f"skip_ms={(_q0-_s0)*1000:.1f} "
+                                    f"bg_ms={(_t1-_q0)*1000:.1f} "
+                                    f"n_msgs={_nm} n_tokens={_nt} "
+                                    f"skip_blocks={_sb} rc={_rc}")
+
+                            if not hasattr(self, "_evict_executor"):
+                                from concurrent.futures import \
+                                    ThreadPoolExecutor
+                                _ev_workers = int(
+                                    os.environ.get(
+                                        "TRTLLM_KV_EVICT_WORKERS", "1"))
+                                self._evict_executor = ThreadPoolExecutor(
+                                    max_workers=_ev_workers,
+                                    thread_name_prefix="kv-evict")
+                            _loop = asyncio.get_event_loop()
+                            _task = _loop.run_in_executor(
+                                self._evict_executor,
+                                self.generator.evict_conversation_prefix,
+                                evict_tokens, sys_skip_blocks)
+                            _task.add_done_callback(_evict_done_migrate)
+                            _migrate_evict_handled = True
+                            logger.debug(
+                                "[evict-server-migrate] FIRE conv="
+                                f"{_migrate_conv_id} "
+                                f"pre_enq_ms={(t_enq-t_render0)*1000:.2f}")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "evict_conversation_prefix(server-migrate) "
+                                f"failed (chat): {exc}")
+                    else:
+                        logger.info(
+                            "[evict-server-migrate] cache miss conv="
+                            f"{_migrate_conv_id} (first turn / TTL / cold-"
+                            "start) - no demotion this turn, current turn "
+                            "will be recorded for next time")
+                # Always record THIS turn's messages so the next turn that
+                # arrives with ``enable_kv_evict=True`` on this conv has
+                # something to replay.  We record dicts (not pydantic
+                # objects) to keep the cache value JSON-friendly and to
+                # match the dict-shape the legacy SLOW_PATH expects.  We
+                # serialize into the same format as the client's
+                # ``_last_messages``: a list of ``{"role": ..., "content":
+                # ...}`` dicts.  Pydantic ``model_dump`` is preferred when
+                # available; otherwise fall back to attribute / dict access.
+                if _migrate_conv_id:
+                    try:
+                        _msgs_dump = []
+                        for m in (request.messages or []):
+                            if hasattr(m, "model_dump"):
+                                _msgs_dump.append(m.model_dump(
+                                    exclude_none=True))
+                            elif isinstance(m, dict):
+                                _msgs_dump.append(dict(m))
+                            else:
+                                _msgs_dump.append({
+                                    "role": getattr(m, "role", ""),
+                                    "content": getattr(m, "content", ""),
+                                })
+                        _PREV_CHAT_MESSAGES_CACHE.put(
+                            _migrate_conv_id, _msgs_dump)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[evict-server-migrate] put failed conv="
+                            f"{_migrate_conv_id}: {exc}")
+            # === end Step 1 server-migrate path ==============================
+
+            # Retrospective demotion (CHAT-CORRECT path).
             # If the client supplied the conversation's prior-turn message
             # list, apply EXACTLY the same chat-template + tokenize pipeline
             # that originally stored those blocks in the KV radix tree, then
@@ -1286,15 +1549,21 @@ class OpenAIServer:
             # (trtllm_kv_evict_prefix_text) is kept for completion clients;
             # for chat it cannot match because it skips the template's
             # special role tokens.
-            evict_msgs = getattr(request, "trtllm_kv_evict_prefix_messages", None)
-            evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
-            evict_token_ids = getattr(
-                request, "trtllm_kv_evict_prefix_token_ids", None)
-            evict_skip_blocks_hint = getattr(
-                request, "trtllm_kv_evict_skip_blocks", None)
-            # Issue #13080 v9n fast-path: client supplied tokens directly.
-            # Bypass the entire render+tokenize step (~22 ms at the
-            # workload_g1_t100 prompt size) and call evict immediately.
+            #
+            # When the server-migrate path above already fired evict for this
+            # request, we skip the legacy fields below to avoid double-firing.
+            evict_msgs = (None if _migrate_evict_handled else getattr(
+                request, "trtllm_kv_evict_prefix_messages", None))
+            evict_text = (None if _migrate_evict_handled else getattr(
+                request, "trtllm_kv_evict_prefix_text", None))
+            evict_token_ids = (None if _migrate_evict_handled else getattr(
+                request, "trtllm_kv_evict_prefix_token_ids", None))
+            evict_skip_blocks_hint = (
+                None if _migrate_evict_handled else getattr(
+                    request, "trtllm_kv_evict_skip_blocks", None))
+            # Fast-path: client supplied tokens directly.  Bypass the
+            # entire render+tokenize step (~22 ms at the workload prompt
+            # size) and call evict immediately.
             # If skip_blocks is also supplied we skip the system-prompt
             # tokenization too; otherwise fall back to ``evict_msgs`` only
             # for that one small piece of work.
@@ -1312,8 +1581,8 @@ class OpenAIServer:
                     else:
                         sys_skip_blocks = 0
                     t_enq = _t.perf_counter()
-                    # Issue #13080 v9o: fire-and-forget evict.  The retrospective
-                    # demote does NOT need to complete before generate_async fires
+                    # Fire-and-forget evict.  The retrospective demote
+                    # does NOT need to complete before generate_async fires
                     # for THIS request -- this conv's own claimMatchingBlocks
                     # operates on a different prefix path than the prior chain
                     # we are demoting.  Letting the evict run concurrently with
@@ -1382,10 +1651,9 @@ class OpenAIServer:
                         f"evict_conversation_prefix(token_ids) failed (chat): {exc}")
             elif evict_msgs and self.tokenizer is not None:
                 try:
-                    # Issue #13080 timing: we want a clean breakdown of
-                    # render / tokenize / RPC-roundtrip latency to localize
-                    # the per-truncation overhead observed at high QPS
-                    # (+12% latency at q=6.9 vs baseline).  Each block is
+                    # Timing: we want a clean breakdown of render /
+                    # tokenize / RPC-roundtrip latency to localize the
+                    # per-truncation overhead.  Each block is
                     # independent, so per-call timestamps are sufficient.
                     import time as _t
                     t_render0 = _t.perf_counter()
@@ -1408,10 +1676,10 @@ class OpenAIServer:
                     evict_tokens = self.tokenizer.tokenizer.encode(
                         rendered, add_special_tokens=False)
                     t_skip0 = _t.perf_counter()
-                    # Issue #13080: protect the leading system-prompt
-                    # blocks from demotion.  Without this guard, the
-                    # walker also demotes shared system blocks during
-                    # brief idle windows -> future cross-conv hits drop.
+                    # Protect the leading system-prompt blocks from
+                    # demotion.  Without this guard, the walker also
+                    # demotes shared system blocks during brief idle
+                    # windows -> future cross-conv hits drop.
                     if evict_skip_blocks_hint is not None:
                         sys_skip_blocks = int(evict_skip_blocks_hint)
                     else:
@@ -1420,7 +1688,7 @@ class OpenAIServer:
                         sys_skip_blocks = _compute_system_skip_blocks(
                             sys_skip_tokens)
                     t_enq = _t.perf_counter()
-                    # Issue #13080 v9o: fire-and-forget (slow path mirror).
+                    # Fire-and-forget (slow path mirror).
                     _n_msgs = len(evict_msgs)
                     _n_tok = len(evict_tokens)
 
@@ -1775,8 +2043,102 @@ class OpenAIServer:
                 kv_retention_config = _build_kv_retention_config(
                     getattr(request, "trtllm_kv_retention_priority", None))
 
-                # Issue #13080 retrospective demotion (same as chat endpoint).
-                evict_text = getattr(request, "trtllm_kv_evict_prefix_text", None)
+                # === Server-side eviction migration (Step 1) =================
+                # Mirror of the chat-endpoint block: when the per-process flag
+                # is on and the client set ``enable_kv_evict=True``, look up
+                # the conversation's previous prompt text from the
+                # completion-specific cache and demote those KV blocks.  For
+                # completion (text-only) requests there is no chat template
+                # to apply; we tokenize the cached prompt with
+                # ``add_special_tokens=False`` (matching how
+                # storeContextBlocks indexed it) and call
+                # ``evict_conversation_prefix`` directly.  ``skip_blocks=0``
+                # is intentional: the completion endpoint has no separate
+                # system-prompt slot to protect, so we let the C++
+                # SHARED_SKIP guard plus radix-tree branch detection do the
+                # right thing.
+                _migrate_conv_id_c = ""
+                _migrate_evict_handled_c = False
+                if _KV_EVICT_SERVER_MIGRATE:
+                    _migrate_conv_id_c = _conv_id_from_request(raw_request)
+                    _migrate_enable_evict_c = bool(
+                        getattr(request, "enable_kv_evict", False))
+                    if (_migrate_enable_evict_c and _migrate_conv_id_c
+                            and self.tokenizer is not None):
+                        _prev_prompt = _PREV_COMPLETION_PROMPT_CACHE.get(
+                            _migrate_conv_id_c)
+                        if _prev_prompt:
+                            try:
+                                import time as _t
+                                t_tok0 = _t.perf_counter()
+                                if isinstance(_prev_prompt, str):
+                                    evict_tokens = (
+                                        self.tokenizer.tokenizer.encode(
+                                            _prev_prompt,
+                                            add_special_tokens=False))
+                                else:
+                                    evict_tokens = list(_prev_prompt)
+                                t_enq = _t.perf_counter()
+                                _n_tok = len(evict_tokens)
+
+                                def _evict_done_migrate_c(
+                                        fut, _t0=t_tok0, _q0=t_enq,
+                                        _nt=_n_tok,
+                                        _cid=_migrate_conv_id_c):
+                                    try:
+                                        _rc = fut.result()
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "evict_conversation_prefix("
+                                            "server-migrate) bg-failed "
+                                            f"(completion): {exc}")
+                                        return
+                                    _t1 = _t.perf_counter()
+                                    logger.info(
+                                        "[evict-server-migrate] BG conv="
+                                        f"{_cid} (completion) "
+                                        f"tokenize_ms={(_q0-_t0)*1000:.1f} "
+                                        f"bg_ms={(_t1-_q0)*1000:.1f} "
+                                        f"n_tokens={_nt} rc={_rc}")
+
+                                if not hasattr(self, "_evict_executor"):
+                                    from concurrent.futures import \
+                                        ThreadPoolExecutor
+                                    _ev_workers = int(
+                                        os.environ.get(
+                                            "TRTLLM_KV_EVICT_WORKERS", "1"))
+                                    self._evict_executor = ThreadPoolExecutor(
+                                        max_workers=_ev_workers,
+                                        thread_name_prefix="kv-evict")
+                                _loop = asyncio.get_event_loop()
+                                _task = _loop.run_in_executor(
+                                    self._evict_executor,
+                                    self.generator.evict_conversation_prefix,
+                                    evict_tokens, 0)
+                                _task.add_done_callback(_evict_done_migrate_c)
+                                _migrate_evict_handled_c = True
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning(
+                                    "evict_conversation_prefix(server-"
+                                    f"migrate) failed (completion): {exc}")
+                        else:
+                            logger.info(
+                                "[evict-server-migrate] cache miss conv="
+                                f"{_migrate_conv_id_c} (completion)")
+                    if _migrate_conv_id_c and isinstance(prompt, str):
+                        try:
+                            _PREV_COMPLETION_PROMPT_CACHE.put(
+                                _migrate_conv_id_c, prompt)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "[evict-server-migrate] put failed "
+                                f"(completion) conv={_migrate_conv_id_c}: "
+                                f"{exc}")
+                # === end Step 1 server-migrate path ==========================
+
+                # Retrospective demotion (same as chat endpoint).
+                evict_text = (None if _migrate_evict_handled_c else getattr(
+                    request, "trtllm_kv_evict_prefix_text", None))
                 if evict_text and self.tokenizer is not None:
                     try:
                         evict_tokens = self.tokenizer.tokenizer.encode(
