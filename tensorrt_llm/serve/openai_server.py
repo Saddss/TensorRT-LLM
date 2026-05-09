@@ -153,6 +153,24 @@ _KV_EVICT_CACHE_TTL_SEC = float(
     os.environ.get("TRTLLM_KV_EVICT_CACHE_TTL_SEC", "1800"))
 _KV_EVICT_CONV_ID_HEADER = "x-flow-conversation-id"
 
+# Process-wide counters and a 30-second KV-stats poller.  Both produce
+# data the operator needs in order to interpret S1 / S3 / S4 dataset
+# experiments (which scenarios actually carry an evict workload, what
+# fraction of dispatches landed on a non-empty KV chain, did the working
+# set ever pressure the free-block pool).  Counters are best-effort and
+# updated under no lock; ints have atomic-enough updates in CPython for
+# this use.  The poller runs as a daemon thread (started lazily on first
+# server entry) so it does not need a fastapi lifespan hook.
+_KV_EVICT_DISPATCH_COUNT = 0
+_KV_EVICT_FAIL_COUNT = 0
+_KV_EVICT_CACHE_MISS_COUNT = 0
+_KV_EVICT_TIMESERIES_PATH = os.environ.get(
+    "TRTLLM_KV_EVICT_TIMESERIES_PATH", "")
+_KV_EVICT_TIMESERIES_INTERVAL_SEC = float(
+    os.environ.get("TRTLLM_KV_EVICT_TIMESERIES_INTERVAL_SEC", "30"))
+_KV_EVICT_POLLER_LOCK = _serv_mig_threading.Lock()
+_KV_EVICT_POLLER_STARTED = False
+
 
 @_serv_mig_dataclass
 class _PrevTurnEntry:
@@ -213,6 +231,144 @@ class _PrevTurnCache:
 # token-id list) is identical across both endpoints, so a per-endpoint
 # split would only fragment the LRU footprint.
 _PREV_TURN_CACHE = _PrevTurnCache()
+
+
+def _maybe_start_kv_evict_poller(server) -> None:
+    """Launch the 30-second KV-stats poller exactly once per process.
+
+    Polls ``server.generator.get_stats_async`` (the same source the
+    Prometheus exporter uses) and appends a CSV row each interval to
+    ``TRTLLM_KV_EVICT_TIMESERIES_PATH``.  Running as a daemon thread
+    that owns its own asyncio loop avoids interfering with the main
+    fastapi/uvicorn loop or the existing
+    ``_iteration_stats_collector_loop``.
+
+    Disabled by leaving ``TRTLLM_KV_EVICT_TIMESERIES_PATH`` unset.  No
+    fallback, no stdout fan-out: the poller is silent unless explicitly
+    pointed at a file.
+    """
+    global _KV_EVICT_POLLER_STARTED
+    if not _KV_EVICT_TIMESERIES_PATH:
+        return
+    with _KV_EVICT_POLLER_LOCK:
+        if _KV_EVICT_POLLER_STARTED:
+            return
+        _KV_EVICT_POLLER_STARTED = True
+
+    def _run():
+        import asyncio as _aio
+        import csv as _csv
+        loop = _aio.new_event_loop()
+        _aio.set_event_loop(loop)
+        try:
+            f = open(_KV_EVICT_TIMESERIES_PATH, "w", buffering=1)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[kv-evict-poller] cannot open "
+                f"{_KV_EVICT_TIMESERIES_PATH}: {exc}; poller disabled")
+            return
+        w = _csv.writer(f)
+        w.writerow([
+            "ts_unix",
+            "free_blocks_min",
+            "cache_hit_rate",
+            "reused_blocks_total",
+            "missed_blocks_total",
+            "num_active_requests",
+            "num_queued_requests",
+            "evict_dispatch_count",
+            "evict_fail_count",
+            "evict_cache_miss_count",
+            "prev_turn_cache_size",
+        ])
+        f.flush()
+
+        prev_reused = 0
+        prev_missed = 0
+
+        async def _poll_once():
+            try:
+                stats_iter = server.generator.get_stats_async(timeout=0.5)
+                latest = None
+                async for s in stats_iter:
+                    latest = s
+                return latest
+            except Exception:  # noqa: BLE001
+                return None
+
+        while True:
+            try:
+                stat = loop.run_until_complete(_poll_once())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[kv-evict-poller] stats poll failed: {exc}")
+                stat = None
+
+            ts = time.time()
+            free_blocks = ""
+            cache_hit_rate = ""
+            reused_blocks = ""
+            missed_blocks = ""
+            num_active = ""
+            num_queued = ""
+            if isinstance(stat, dict):
+                num_active = stat.get("numActiveRequests", "")
+                num_queued = stat.get("numQueuedRequests", "")
+                kv = stat.get("kvCacheStats") or {}
+                cache_hit_rate = kv.get("cacheHitRate", "")
+                reused = kv.get("reusedBlocks")
+                missed = kv.get("missedBlocks")
+                if reused is not None:
+                    reused_blocks = reused
+                    prev_reused = reused  # absolute, for next-iteration delta
+                if missed is not None:
+                    missed_blocks = missed
+                    prev_missed = missed
+                # Pick the tightest window's free count when VSWA, fall
+                # back to scalar for fixed-window models.
+                free_per_window = (
+                    kv.get("freeNumBlocks")
+                    if "freeNumBlocks" in kv
+                    else kv.get("numFreeBlocksPerWindowSize"))
+                if isinstance(free_per_window, dict) and free_per_window:
+                    try:
+                        free_blocks = min(int(v)
+                                          for v in free_per_window.values())
+                    except Exception:  # noqa: BLE001
+                        free_blocks = ""
+                elif isinstance(free_per_window, (int, float)):
+                    free_blocks = int(free_per_window)
+                elif "freeNumBlocks" in kv:
+                    fb = kv.get("freeNumBlocks")
+                    free_blocks = (int(fb)
+                                   if isinstance(fb, (int, float)) else "")
+
+            try:
+                w.writerow([
+                    f"{ts:.3f}",
+                    free_blocks,
+                    cache_hit_rate,
+                    reused_blocks,
+                    missed_blocks,
+                    num_active,
+                    num_queued,
+                    _KV_EVICT_DISPATCH_COUNT,
+                    _KV_EVICT_FAIL_COUNT,
+                    _KV_EVICT_CACHE_MISS_COUNT,
+                    _PREV_TURN_CACHE.size(),
+                ])
+                f.flush()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[kv-evict-poller] write failed: {exc}")
+
+            time.sleep(_KV_EVICT_TIMESERIES_INTERVAL_SEC)
+
+    t = _serv_mig_threading.Thread(
+        target=_run, name="kv-evict-poller", daemon=True)
+    t.start()
+    logger.info(
+        "[kv-evict-poller] started, interval="
+        f"{_KV_EVICT_TIMESERIES_INTERVAL_SEC}s, "
+        f"path={_KV_EVICT_TIMESERIES_PATH}")
 
 
 # Tokens that ``apply_chat_template(..., add_generation_prompt=True)``
@@ -1554,6 +1710,7 @@ class OpenAIServer:
             _migrate_conv_id = ""
             _migrate_evict_handled = False
             if _KV_EVICT_SERVER_MIGRATE:
+                _maybe_start_kv_evict_poller(self)
                 _migrate_conv_id = _conv_id_from_request(raw_request)
                 _migrate_enable_evict = bool(
                     getattr(request, "enable_kv_evict", False))
@@ -1567,15 +1724,19 @@ class OpenAIServer:
                             _prev_tokens = _prev_entry.prompt_token_ids
                             _prev_skip = _prev_entry.skip_blocks
                             _n_tok = len(_prev_tokens)
+                            global _KV_EVICT_DISPATCH_COUNT
+                            _KV_EVICT_DISPATCH_COUNT += 1
 
                             def _evict_done_migrate(
                                     fut,
                                     _q0=t_enq, _nt=_n_tok,
                                     _sb=_prev_skip,
                                     _cid=_migrate_conv_id):
+                                global _KV_EVICT_FAIL_COUNT
                                 try:
                                     _rc = fut.result()
                                 except Exception as exc:  # noqa: BLE001
+                                    _KV_EVICT_FAIL_COUNT += 1
                                     logger.warning(
                                         "evict_conversation_prefix(server-"
                                         f"migrate) bg-failed (chat): {exc}")
@@ -1608,6 +1769,8 @@ class OpenAIServer:
                                 "evict_conversation_prefix(server-migrate) "
                                 f"failed (chat): {exc}")
                     else:
+                        global _KV_EVICT_CACHE_MISS_COUNT
+                        _KV_EVICT_CACHE_MISS_COUNT += 1
                         logger.info(
                             "[evict-server-migrate] cache miss conv="
                             f"{_migrate_conv_id} (first turn / TTL / cold-"
@@ -2183,6 +2346,7 @@ class OpenAIServer:
                 _migrate_conv_id_c = ""
                 _migrate_evict_handled_c = False
                 if _KV_EVICT_SERVER_MIGRATE:
+                    _maybe_start_kv_evict_poller(self)
                     _migrate_conv_id_c = _conv_id_from_request(raw_request)
                     _migrate_enable_evict_c = bool(
                         getattr(request, "enable_kv_evict", False))
@@ -2198,14 +2362,18 @@ class OpenAIServer:
                                     _prev_entry_c.prompt_token_ids)
                                 _prev_skip_c = _prev_entry_c.skip_blocks
                                 _n_tok = len(_prev_tokens_c)
+                                global _KV_EVICT_DISPATCH_COUNT
+                                _KV_EVICT_DISPATCH_COUNT += 1
 
                                 def _evict_done_migrate_c(
                                         fut, _q0=t_enq, _nt=_n_tok,
                                         _sb=_prev_skip_c,
                                         _cid=_migrate_conv_id_c):
+                                    global _KV_EVICT_FAIL_COUNT
                                     try:
                                         _rc = fut.result()
                                     except Exception as exc:  # noqa: BLE001
+                                        _KV_EVICT_FAIL_COUNT += 1
                                         logger.warning(
                                             "evict_conversation_prefix("
                                             "server-migrate) bg-failed "
@@ -2240,6 +2408,8 @@ class OpenAIServer:
                                     "evict_conversation_prefix(server-"
                                     f"migrate) failed (completion): {exc}")
                         else:
+                            global _KV_EVICT_CACHE_MISS_COUNT
+                            _KV_EVICT_CACHE_MISS_COUNT += 1
                             logger.info(
                                 "[evict-server-migrate] cache miss conv="
                                 f"{_migrate_conv_id_c} (completion)")
